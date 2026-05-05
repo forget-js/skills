@@ -3,7 +3,7 @@ name: yitang-doc-save
 description: >-
   当用户提供 yitang.top 课件文档 URL 并要求保存/下载页面时触发。
   将页面完整内容（文字、样式、图片、排版）保存为本地 HTML 和 Markdown 文件。
-version: 1.0.0
+version: 1.1.0
 requires:
   node: ">=18"
   playwright: "^1.59"
@@ -23,42 +23,44 @@ requires:
 
 ## 路径约定
 
-- **推荐**：在 `save-webpage/` 目录下执行命令
-- **可选**：设置环境变量 `YITANG_SAVE_ROOT` 为该目录的绝对路径，即可在任意 cwd 调用 `save.js`
+- **产出物**保存到当前工作目录（即用户在 IDE 中打开的项目根目录）
+- **脚本、GO 信号文件、browser-data** 仍在 skill 的 `save-webpage/` 目录下
 - 不写死任何机器的绝对路径，保持仓库可移植
 
-## 输出目录命名（必须先与用户确认）
+## 输出目录命名
 
-1. 禁止在未征得用户同意时，使用 URL 中的 id、哈希或随机串作为输出目录名
-2. 若用户已给出明确名称（如「清单体笔记」），直接使用
-3. 若用户同意以页面标题命名，传入第三个参数 `__FROM_TITLE__`，脚本会自动用标题生成安全目录名并打印 `YITANG_OUTPUT_DIR`
-4. 页面加载后会输出 `YITANG_DOC_TITLE`（JSON 字符串），可用于与用户核对标题
+1. 若用户在消息中已给出明确名称（如「清单体笔记」），**直接使用，不要再询问**
+2. 若用户未指定名称，使用 `AskUserQuestion` 提供选项：
+   - 「以页面标题命名」— 传入 `__FROM_TITLE__`，脚本自动用标题生成安全目录名
+   - 「我来自定义」— 让用户手动输入名称
 
 ## 使用流程
 
-用户提供 URL 后，先确认输出目录名，再执行以下步骤：
+用户提供 URL 后，按以下步骤执行：
 
-### 步骤 1：启动脚本
+### 步骤 1：确认输出目录名
+
+- 用户已指定名称 → 直接进入步骤 2
+- 用户未指定 → 使用 `AskUserQuestion` 让用户选择命名方式
+
+### 步骤 2：启动脚本
+
+在项目根目录下执行：
 
 ```bash
-cd save-webpage
-node save.js "<文档URL>" "<输出目录名>"
-# 或以页面标题命名（需用户事先同意）：
-node save.js "<文档URL>" "__FROM_TITLE__"
+node yitang-doc-save/save-webpage/save.js "<文档URL>" "<输出目录名>"
+# 或以页面标题命名：
+node yitang-doc-save/save-webpage/save.js "<文档URL>" "__FROM_TITLE__"
 ```
 
-非阻塞启动，等待输出中出现「页面已打开」及 `YITANG_DOC_TITLE`。
-
-### 步骤 2：等待用户确认
-
-告知用户浏览器已打开，请确认正文内容与标题显示正常后再继续。
+使用 `run_in_background` 非阻塞启动，等待输出中出现 `YITANG_DOC_TITLE` 和 `YITANG_OUTPUT_DIR`。
 
 ### 步骤 3：触发保存
 
-在 `save-webpage/` 目录下创建 `GO` 信号文件：
+页面加载完成后，直接创建 `GO` 信号文件：
 
 ```bash
-touch GO
+touch yitang-doc-save/save-webpage/GO
 ```
 
 ### 步骤 4：监控进度
@@ -82,7 +84,7 @@ touch GO
 
 - 页面使用虚拟列表，必须滚动采集，不能直接另存 MHTML
 - 通过 `GO` 信号文件触发保存，避免终端交互阻塞
-- `YITANG_SAVE_ROOT` 环境变量支持在任意 cwd 调用脚本
+- 产出物写入当前工作目录（`process.cwd()`），与 skill 脚本分离
 
 ## 脚本位置
 

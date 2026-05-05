@@ -500,10 +500,10 @@ function escapeAttr(text) {
       await browser.close();
       process.exit(1);
     }
-    console.log('YITANG_OUTPUT_DIR: ' + JSON.stringify(outputName));
   }
 
-  const OUTPUT_DIR = path.join(SAVE_ROOT, outputName);
+  const OUTPUT_DIR = path.join(process.cwd(), outputName);
+  console.log('YITANG_OUTPUT_DIR: ' + JSON.stringify(OUTPUT_DIR));
   const IMG_DIR = path.join(OUTPUT_DIR, 'images');
   if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   if (!fs.existsSync(IMG_DIR)) fs.mkdirSync(IMG_DIR, { recursive: true });
