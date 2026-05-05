@@ -1,6 +1,6 @@
 # Skills 仓库
 
-自定义 Claude Code Skills 集合。详细说明见 [README.md](./README.md)。
+自定义 Claude Code Skills 集合。
 
 ## 可用 Skills
 
