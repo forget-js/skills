@@ -1,0 +1,696 @@
+const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+
+/** 项目根（含 save.js、browser-data）。可通过环境变量在其他工作目录下调用脚本。 */
+const SAVE_ROOT = process.env.YITANG_SAVE_ROOT
+  ? path.resolve(process.env.YITANG_SAVE_ROOT)
+  : __dirname;
+
+const TARGET_URL = process.argv[2];
+const OUTPUT_NAME_ARG = process.argv[3];
+const FROM_TITLE_SENTINEL = '__FROM_TITLE__';
+
+if (!TARGET_URL) {
+  console.error('用法: node save.js <URL> <输出目录名|' + FROM_TITLE_SENTINEL + '>');
+  console.error('  输出目录名须与用户确认，勿使用 URL 中的 id。');
+  console.error('  若用户同意以页面标题作为文件夹名，传入 ' + FROM_TITLE_SENTINEL + '（加载后自动用标题生成目录名）。');
+  console.error('  可选环境变量 YITANG_SAVE_ROOT=本目录绝对路径（在任意 cwd 下运行脚本时使用）。');
+  process.exit(1);
+}
+if (!OUTPUT_NAME_ARG) {
+  console.error('错误: 缺少输出目录名。请与用户确认后传入第 3 个参数，勿留空。');
+  process.exit(1);
+}
+
+const SIGNAL_FILE = path.join(SAVE_ROOT, 'GO');
+const USER_DATA_DIR = path.join(SAVE_ROOT, 'browser-data');
+
+function sanitizeForDir(name) {
+  if (!name || typeof name !== 'string') return '';
+  const s = name
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '');
+  return s.substring(0, 120) || '';
+}
+
+async function getDocumentTitle(page) {
+  const raw = await page.evaluate(() => {
+    const t = (document.title && document.title.trim()) || '';
+    const og = document.querySelector('meta[property="og:title"]');
+    const ogT = og && (og.getAttribute('content') || '').trim();
+    return { title: t, og: ogT };
+  });
+  let cand = (raw.og || raw.title || '').trim();
+  cand = cand
+    .replace(/\s*[-|·｜]\s*一堂创业课\s*$/i, '')
+    .replace(/\s*[-|·｜]\s*一堂\s*$/i, '')
+    .trim();
+  return cand;
+}
+
+async function waitForSignalFile() {
+  console.log('等待信号文件...');
+  while (!fs.existsSync(SIGNAL_FILE)) await new Promise(r => setTimeout(r, 1000));
+  fs.unlinkSync(SIGNAL_FILE);
+  console.log('收到信号，开始！\n');
+}
+
+function extractBlockContent() {
+  const container = document.querySelector('.virtual-list > div');
+  if (!container) return [];
+
+  function getRenderedStyles(el) {
+    const cs = getComputedStyle(el);
+    const styles = [];
+
+    const color = cs.color;
+    if (color && color !== 'rgb(51, 51, 51)' && color !== 'rgb(0, 0, 0)' && color !== 'rgba(0, 0, 0, 0)') {
+      styles.push(`color: ${color}`);
+    }
+
+    const bg = cs.backgroundColor;
+    if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && bg !== 'rgb(255, 255, 255)') {
+      styles.push(`background-color: ${bg}`);
+    }
+
+    const fw = cs.fontWeight;
+    if (fw === '700' || fw === 'bold') {
+      styles.push('font-weight: 700');
+    }
+
+    const fs = parseInt(cs.fontSize);
+    if (fs && fs !== 16 && fs !== 15) {
+      styles.push(`font-size: ${fs}px`);
+    }
+
+    const td = cs.textDecorationLine || cs.textDecoration;
+    if (td && td !== 'none') {
+      styles.push(`text-decoration: ${td}`);
+    }
+
+    return styles.length ? styles.join('; ') : '';
+  }
+
+  function cleanHTML(el) {
+    if (el.nodeType === 3) return el.textContent;
+    if (el.nodeType !== 1) return '';
+
+    const tag = el.tagName.toLowerCase();
+    if (['script', 'style', 'svg', 'button', 'input'].includes(tag)) return '';
+
+    if (tag === 'img') {
+      const src = el.getAttribute('src') || '';
+      if (!src) return '';
+      return `<img src="${src}" alt="" loading="lazy">`;
+    }
+
+    let childrenHTML = '';
+    for (const child of el.childNodes) {
+      childrenHTML += cleanHTML(child);
+    }
+
+    if (tag === 'br') return '<br>';
+
+    if (tag === 'span') {
+      const style = getRenderedStyles(el);
+      if (style) return `<span style="${style}">${childrenHTML}</span>`;
+      return childrenHTML;
+    }
+
+    if (['strong', 'b'].includes(tag)) return `<strong>${childrenHTML}</strong>`;
+    if (['em', 'i'].includes(tag)) return `<em>${childrenHTML}</em>`;
+    if (tag === 'u') return `<u>${childrenHTML}</u>`;
+    if (tag === 'a') {
+      const href = el.getAttribute('href') || '';
+      return `<a href="${href}" target="_blank">${childrenHTML}</a>`;
+    }
+
+    return childrenHTML;
+  }
+
+  const items = container.querySelectorAll('div[role="listitem"]');
+  const results = [];
+
+  for (const item of items) {
+    const rect = item.getBoundingClientRect();
+    if (rect.bottom < -200 || rect.top > window.innerHeight + 200) continue;
+    if (rect.height < 2) continue;
+
+    const classMatch = item.className.match(/item-([A-Za-z0-9]+)/g);
+    const itemId = classMatch ? classMatch.find(c => c.length > 10) || classMatch[0] : null;
+    if (!itemId) continue;
+
+    const block = item.querySelector('.block') || item;
+    const blockClass = block.className || '';
+
+    let type = 'text';
+    let content = '';
+    let imgSrc = '';
+    let level = 0;
+
+    if (blockClass.includes('image-block') || blockClass.includes('img-block')) {
+      const allImgs = item.querySelectorAll('img[src]');
+      if (allImgs.length > 1) {
+        type = 'images';
+        const srcs = [];
+        allImgs.forEach(img => { if (img.src) srcs.push(img.src); });
+        content = srcs.map(s => `<img src="${s}" alt="" loading="lazy" style="display: inline-block; vertical-align: top; margin: 4px; max-width: ${Math.floor(90 / srcs.length)}%;">`).join('');
+      } else {
+        type = 'image';
+        const img = allImgs[0];
+        if (img) imgSrc = img.src;
+      }
+    } else if (blockClass.includes('code-block') || blockClass.includes('codeblock')) {
+      type = 'code';
+      const codeEl = item.querySelector('code, pre, .code-content');
+      content = codeEl ? codeEl.textContent : item.textContent;
+    } else if (blockClass.includes('callout') || blockClass.includes('quote') || blockClass.includes('blockquote')) {
+      type = 'quote';
+      const aceLines = item.querySelectorAll('.ace-line');
+      if (aceLines.length > 0) {
+        content = Array.from(aceLines).map(l => cleanHTML(l)).join('<br>');
+      } else {
+        content = cleanHTML(item);
+      }
+    } else if (blockClass.includes('table') || item.querySelector('table')) {
+      type = 'table';
+      const table = item.querySelector('table');
+      if (table) {
+        // Use original innerHTML, only strip class/data attributes, keep style
+        let tableHtml = table.outerHTML;
+        tableHtml = tableHtml.replace(/\s+class="[^"]*"/g, '');
+        tableHtml = tableHtml.replace(/\s+data-[a-z-]+="[^"]*"/g, '');
+        // Ensure table fits in container
+        tableHtml = tableHtml.replace(/<table/, '<table style="width: 100%; border-collapse: collapse; table-layout: auto;"');
+        // Constrain images within table cells
+        tableHtml = tableHtml.replace(/<img /g, '<img style="max-width: 200px; height: auto; display: inline-block; vertical-align: top; margin: 2px;" ');
+        content = tableHtml;
+      }
+    } else {
+      // Text / heading / list
+      const aceLines = item.querySelectorAll('.ace-line');
+      if (aceLines.length > 0) {
+        content = Array.from(aceLines).map(l => cleanHTML(l)).join('<br>');
+      } else {
+        content = cleanHTML(item);
+      }
+
+      // Detect heading
+      const headingMatch = blockClass.match(/heading(\d)/i);
+      if (headingMatch) {
+        type = 'heading';
+        level = parseInt(headingMatch[1]) || 1;
+      } else {
+        const firstSpan = item.querySelector('span[style*="font-size"]');
+        if (firstSpan) {
+          const fontSize = parseInt(getComputedStyle(firstSpan).fontSize);
+          if (fontSize >= 28) { type = 'heading'; level = 1; }
+          else if (fontSize >= 24) { type = 'heading'; level = 2; }
+          else if (fontSize >= 20) { type = 'heading'; level = 3; }
+        }
+        const boldEl = item.querySelector('[style*="font-weight: 700"], [style*="font-weight:700"], b, strong');
+        const plainText = item.textContent?.trim() || '';
+        if (boldEl && plainText.length < 50 && !plainText.includes('\n') && plainText.length > 0) {
+          const fontSize = parseInt(getComputedStyle(boldEl).fontSize);
+          if (fontSize >= 20 && type !== 'heading') { type = 'heading'; level = 3; }
+        }
+      }
+
+      // Detect ordered vs unordered list
+      if (blockClass.includes('list') || blockClass.includes('bullet') || blockClass.includes('ordered')) {
+        if (blockClass.includes('ordered') || blockClass.includes('number')) {
+          type = 'ol';
+        } else {
+          type = 'ul';
+        }
+        // Try to get the list number from the rendered content
+        const numEl = item.querySelector('.list-block-number, .ordered-list-number, [class*="number"]');
+        if (numEl) {
+          type = 'ol';
+        }
+      }
+
+      // Check for inline images in text blocks
+      const inlineImgs = item.querySelectorAll('img[src]');
+      if (inlineImgs.length > 1 && !content.replace(/<[^>]+>/g, '').trim()) {
+        type = 'images';
+        const srcs = [];
+        inlineImgs.forEach(img => { if (img.src) srcs.push(img.src); });
+        content = srcs.map(s => `<img src="${s}" alt="" loading="lazy" style="display: inline-block; vertical-align: top; margin: 4px; max-width: ${Math.floor(90 / srcs.length)}%;">`).join('');
+      } else if (inlineImgs.length === 1 && !content.replace(/<[^>]+>/g, '').trim()) {
+        type = 'image';
+        imgSrc = inlineImgs[0].src;
+      }
+    }
+
+    if (type === 'images') { /* multi-image, content already set */ }
+    else if (type !== 'image' && !content.replace(/<[^>]+>/g, '').trim()) continue;
+    else if (type === 'image' && !imgSrc) continue;
+
+    // Capture container visual styles
+    let containerStyle = '';
+    const blockEl = item.querySelector('.block') || item;
+    const contentWrap = blockEl.querySelector('[class*="content"]') || blockEl;
+    const bcs = getComputedStyle(contentWrap);
+    const cStyles = [];
+
+    const cbg = bcs.backgroundColor;
+    if (cbg && cbg !== 'rgba(0, 0, 0, 0)' && cbg !== 'transparent' && cbg !== 'rgb(255, 255, 255)') {
+      cStyles.push(`background-color: ${cbg}`);
+    }
+    const cborder = bcs.border;
+    const cbl = bcs.borderLeft;
+    if (cbl && !cbl.includes('0px') && cbl !== 'none') {
+      cStyles.push(`border-left: ${cbl}`);
+    }
+    const cbr = bcs.borderRadius;
+    if (cbr && cbr !== '0px') {
+      cStyles.push(`border-radius: ${cbr}`);
+    }
+    const cbs = bcs.boxShadow;
+    if (cbs && cbs !== 'none') {
+      cStyles.push(`box-shadow: ${cbs}`);
+    }
+    const cpad = bcs.padding;
+    if (cpad && cpad !== '0px') {
+      cStyles.push(`padding: ${cpad}`);
+    }
+    const cta = bcs.textAlign;
+    if (cta && cta !== 'start' && cta !== 'left') {
+      cStyles.push(`text-align: ${cta}`);
+    }
+
+    if (cStyles.length) containerStyle = cStyles.join('; ');
+
+    results.push({ itemId, type, content, imgSrc, level, containerStyle });
+  }
+
+  return results;
+}
+
+async function scrollAndExtract(page) {
+  const totalHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+  const viewportHeight = await page.evaluate(() => window.innerHeight);
+  const stepSize = Math.floor(viewportHeight * 0.5);
+
+  console.log(`  页面总高度: ${totalHeight}px, 步长: ${stepSize}px`);
+
+  const allBlocks = new Map();
+  const allImageUrls = new Set();
+  let step = 0;
+  const totalSteps = Math.ceil(totalHeight / stepSize);
+
+  for (let scrollY = 0; scrollY < totalHeight; scrollY += stepSize) {
+    await page.evaluate(y => window.scrollTo(0, y), scrollY);
+    await page.waitForTimeout(350);
+
+    const blocks = await page.evaluate(extractBlockContent);
+
+    for (const block of blocks) {
+      if (!allBlocks.has(block.itemId)) {
+        allBlocks.set(block.itemId, block);
+        if (block.imgSrc && !block.imgSrc.startsWith('data:')) {
+          allImageUrls.add(block.imgSrc);
+        }
+        // Collect image URLs from multi-image content
+        if (block.type === 'images' && block.content) {
+          const srcMatches = block.content.match(/src="([^"]+)"/g);
+          if (srcMatches) {
+            srcMatches.forEach(m => {
+              const url = m.replace('src="', '').replace('"', '');
+              if (!url.startsWith('data:')) allImageUrls.add(url);
+            });
+          }
+        }
+      }
+    }
+
+    step++;
+    if (step % 15 === 0) {
+      console.log(`  进度: ${Math.min(100, Math.round(scrollY / totalHeight * 100))}% (${allBlocks.size} 块, ${allImageUrls.size} 图片)`);
+    }
+  }
+
+  console.log(`  ✓ 采集完成: ${allBlocks.size} 个内容块, ${allImageUrls.size} 张图片`);
+  return { blocks: [...allBlocks.values()], imageUrls: [...allImageUrls] };
+}
+
+async function downloadImages(page, imageUrls, imgDir) {
+  console.log(`  下载 ${imageUrls.length} 张图片...`);
+  const imgMap = {};
+  let success = 0, fail = 0;
+
+  for (let i = 0; i < imageUrls.length; i++) {
+    const url = imageUrls[i];
+    const ext = (url.match(/\.(jpg|jpeg|png|gif|webp|svg)/i) || [, 'png'])[1];
+    const filename = `img_${String(i).padStart(3, '0')}.${ext}`;
+    const destPath = path.join(imgDir, filename);
+
+    try {
+      const base64 = await page.evaluate(async (imgUrl) => {
+        const resp = await fetch(imgUrl);
+        const blob = await resp.blob();
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+      }, url);
+
+      const matches = base64.match(/^data:([^;]+);base64,(.+)$/);
+      if (matches) {
+        fs.writeFileSync(destPath, Buffer.from(matches[2], 'base64'));
+        imgMap[url] = `images/${filename}`;
+        success++;
+      }
+    } catch (e) { fail++; }
+
+    if ((i + 1) % 30 === 0) console.log(`    ${i + 1}/${imageUrls.length}`);
+  }
+
+  console.log(`  ✓ 图片: ${success} 成功, ${fail} 失败`);
+  return imgMap;
+}
+
+function buildCleanHTML(blocks, imgMap, docTitle) {
+  const lines = [];
+
+  function replaceImgUrls(html) {
+    let result = html;
+    for (const [url, localPath] of Object.entries(imgMap)) {
+      result = result.split(url).join(localPath);
+    }
+    return result;
+  }
+
+  for (const block of blocks) {
+    const content = replaceImgUrls(block.content);
+    const cs = block.containerStyle;
+    const wrapOpen = cs ? `<div style="${cs}">` : '';
+    const wrapClose = cs ? '</div>' : '';
+
+    let inner = '';
+    switch (block.type) {
+      case 'heading': {
+        const tag = `h${Math.min(6, Math.max(1, block.level || 2))}`;
+        inner = `<${tag}>${content}</${tag}>`;
+        break;
+      }
+      case 'image': {
+        const src = imgMap[block.imgSrc] || block.imgSrc;
+        inner = `<figure><img src="${escapeAttr(src)}" alt="" loading="lazy"></figure>`;
+        break;
+      }
+      case 'images': {
+        inner = `<figure>${content}</figure>`;
+        break;
+      }
+      case 'code':
+        inner = `<pre><code>${escapeHtml(block.content)}</code></pre>`;
+        break;
+      case 'quote':
+        inner = `<blockquote>${content}</blockquote>`;
+        break;
+      case 'table':
+        inner = content;
+        break;
+      case 'ol':
+        inner = `<ol><li>${content}</li></ol>`;
+        break;
+      case 'ul':
+        inner = `<ul><li>${content}</li></ul>`;
+        break;
+      default:
+        inner = `<p>${content}</p>`;
+        break;
+    }
+
+    lines.push(cs ? `${wrapOpen}${inner}${wrapClose}` : inner);
+  }
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(docTitle || '页面内容保存')}</title>
+  <style>
+    body {
+      max-width: 800px; margin: 40px auto; padding: 0 20px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 16px; line-height: 1.8; color: #333; background: #fff;
+    }
+    h1 { font-size: 28px; margin: 2em 0 0.5em; border-bottom: 1px solid #eee; padding-bottom: 0.3em; }
+    h2 { font-size: 22px; margin: 1.8em 0 0.5em; }
+    h3 { font-size: 19px; margin: 1.5em 0 0.5em; }
+    h4, h5, h6 { font-size: 17px; margin: 1.2em 0 0.5em; }
+    p { margin: 0.8em 0; }
+    figure { margin: 1.5em 0; text-align: center; }
+    img { max-width: 100%; height: auto; border-radius: 4px; }
+    pre { background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 14px; line-height: 1.5; }
+    code { font-family: "Fira Code", Consolas, monospace; }
+    blockquote { border-left: 4px solid #ddd; margin: 1em 0; padding: 0.5em 1em; color: #555; background: #fafafa; border-radius: 0 4px 4px 0; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    td, th { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+    th { background: #f5f5f5; font-weight: 600; }
+    ul, ol { margin: 0.5em 0; padding-left: 2em; }
+    li { margin: 0.3em 0; }
+  </style>
+</head>
+<body>
+${lines.join('\n')}
+</body>
+</html>`;
+}
+
+function escapeHtml(text) {
+  return (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function escapeAttr(text) {
+  return (text || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+}
+
+(async () => {
+  if (fs.existsSync(SIGNAL_FILE)) fs.unlinkSync(SIGNAL_FILE);
+
+  console.log('正在启动浏览器...');
+  const browser = await chromium.launchPersistentContext(USER_DATA_DIR, {
+    headless: false,
+    args: ['--disable-web-security', '--no-sandbox'],
+    viewport: { width: 1440, height: 900 },
+    locale: 'zh-CN'
+  });
+
+  const page = browser.pages()[0] || await browser.newPage();
+  console.log('正在打开页面...');
+  await page.goto(TARGET_URL, { waitUntil: 'networkidle', timeout: 120000 });
+
+  const docTitle = await getDocumentTitle(page);
+  console.log('YITANG_DOC_TITLE: ' + JSON.stringify(docTitle));
+
+  let outputName = OUTPUT_NAME_ARG;
+  if (OUTPUT_NAME_ARG === FROM_TITLE_SENTINEL) {
+    outputName = sanitizeForDir(docTitle);
+    if (!outputName) {
+      console.error('无法从页面得到可用于目录名的标题，请关闭浏览器后改用显式输出目录名重新运行。');
+      await browser.close();
+      process.exit(1);
+    }
+    console.log('YITANG_OUTPUT_DIR: ' + JSON.stringify(outputName));
+  }
+
+  const OUTPUT_DIR = path.join(SAVE_ROOT, outputName);
+  const IMG_DIR = path.join(OUTPUT_DIR, 'images');
+  if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  if (!fs.existsSync(IMG_DIR)) fs.mkdirSync(IMG_DIR, { recursive: true });
+
+  console.log('页面已打开。请确认内容与标题无误后，再触发保存（GO 信号）。\n');
+
+  await waitForSignalFile();
+
+  console.log('步骤 1/3: 逐屏滚动 + 提取内容块...');
+  const { blocks, imageUrls } = await scrollAndExtract(page);
+
+  console.log('\n步骤 2/3: 下载图片...');
+  const imgMap = await downloadImages(page, imageUrls, IMG_DIR);
+
+  console.log('\n步骤 3/4: 生成基础 HTML...');
+  function stripTags(s) {
+    return (s || '')
+      .replace(/<br\s*\/?>/g, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\u200b/g, '')
+      .trim();
+  }
+  const firstBlock = blocks[0];
+  const firstHeadingText = firstBlock && firstBlock.type === 'heading' ? stripTags(firstBlock.content) : '';
+  const docTitleBanner = docTitle && firstHeadingText !== docTitle
+    ? `<header class="saved-doc-heading"><h1 class="saved-doc-title">${escapeHtml(docTitle)}</h1></header>\n`
+    : '';
+
+  let html = buildCleanHTML(blocks, imgMap, docTitle);
+
+  // === Inline postprocess ===
+  console.log('\n步骤 4/4: 后处理（目录 + Markdown）...');
+
+  // Add IDs to headings and build TOC
+  const toc = [];
+  let hCounter = 0;
+  html = html.replace(/<(h[1-6])>([\s\S]*?)<\/\1>/g, (match, tag, inner) => {
+    hCounter++;
+    const id = `section-${hCounter}`;
+    const level = parseInt(tag[1]);
+    const text = inner.replace(/<[^>]+>/g, '').replace(/\u200b/g, '').replace(/&#8203;/g, '').trim();
+    if (text) toc.push({ id, level, text });
+    return `<${tag} id="${id}">${inner}</${tag}>`;
+  });
+  console.log(`  标题: ${toc.length} 个`);
+
+  // Build TOC HTML
+  let tocHtml = '<nav id="sidebar-toc">\n<div class="toc-title">目录</div>\n<ul>\n';
+  for (const t of toc) {
+    const cls = t.level === 1 ? 'toc-h1' : t.level === 2 ? 'toc-h2' : 'toc-h3';
+    tocHtml += `  <li class="${cls}"><a href="#${t.id}">${t.text.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</a></li>\n`;
+  }
+  tocHtml += '</ul>\n</nav>\n';
+
+  // Replace style block
+  const sidebarStyle = `
+  <style>
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 16px; line-height: 1.8; color: #333; background: #fff; display: flex; }
+    #sidebar-toc { position: fixed; left: 0; top: 0; bottom: 0; width: 280px; padding: 20px 0; background: #f8f9fa; border-right: 1px solid #e5e7eb; overflow-y: auto; z-index: 100; }
+    #sidebar-toc .toc-title { font-size: 18px; font-weight: 700; padding: 10px 20px 15px; color: #111; border-bottom: 1px solid #e5e7eb; margin-bottom: 8px; }
+    #sidebar-toc ul { list-style: none; margin: 0; padding: 0; }
+    #sidebar-toc li a { display: block; padding: 5px 20px; color: #555; text-decoration: none; font-size: 14px; line-height: 1.5; border-left: 3px solid transparent; transition: all 0.2s; }
+    #sidebar-toc li a:hover { color: #1a73e8; background: #e8f0fe; border-left-color: #1a73e8; }
+    #sidebar-toc li.toc-h1 a { font-weight: 600; padding-left: 20px; }
+    #sidebar-toc li.toc-h2 a { padding-left: 36px; }
+    #sidebar-toc li.toc-h3 a { padding-left: 52px; font-size: 13px; color: #777; }
+    #sidebar-toc li.active a { color: #1a73e8; background: #e8f0fe; border-left-color: #1a73e8; font-weight: 600; }
+    #main-content { margin-left: 340px; max-width: 800px; padding: 40px 60px; }
+    .saved-doc-heading { margin: 0 0 2em; }
+    .saved-doc-heading .saved-doc-title { font-size: 28px; margin: 0 0 0.5em; border-bottom: 1px solid #eee; padding-bottom: 0.3em; }
+    h1 { font-size: 28px; margin: 2em 0 0.5em; border-bottom: 1px solid #eee; padding-bottom: 0.3em; }
+    h2 { font-size: 22px; margin: 1.8em 0 0.5em; }
+    h3 { font-size: 19px; margin: 1.5em 0 0.5em; }
+    h4, h5, h6 { font-size: 17px; margin: 1.2em 0 0.5em; }
+    p { margin: 0.8em 0; }
+    figure { margin: 1.5em 0; text-align: center; }
+    img { max-width: 100%; height: auto; border-radius: 4px; }
+    pre { background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 14px; line-height: 1.5; }
+    code { font-family: "Fira Code", Consolas, monospace; }
+    blockquote { border-left: 4px solid #ddd; margin: 1em 0; padding: 0.5em 1em; color: #555; background: #fafafa; border-radius: 0 4px 4px 0; }
+    .table-wrapper { overflow-x: auto; margin: 1em 0; }
+    td img, th img { max-width: 100%; height: auto; }
+    ul, ol { margin: 0.5em 0; padding-left: 2em; }
+    li { margin: 0.3em 0; }
+    @media (max-width: 900px) { #sidebar-toc { display: none; } #main-content { margin-left: 0; padding: 20px; } }
+  </style>`;
+
+  const scrollScript = [
+    '<script>',
+    '(function() {',
+    '  var hs = document.querySelectorAll("#main-content h1, #main-content h2, #main-content h3");',
+    '  var ls = document.querySelectorAll("#sidebar-toc li");',
+    '  if (!hs.length || !ls.length) return;',
+    '  function update() {',
+    '    var cur = "";',
+    '    for (var h of hs) { if (h.getBoundingClientRect().top <= 120) cur = h.id; }',
+    '    ls.forEach(function(li) {',
+    '      var a = li.querySelector("a");',
+    '      if (a && a.getAttribute("href") === "#" + cur) { li.classList.add("active"); li.scrollIntoView({ block: "nearest" }); }',
+    '      else { li.classList.remove("active"); }',
+    '    });',
+    '  }',
+    '  window.addEventListener("scroll", update, { passive: true });',
+    '  update();',
+    '})();',
+    '</script>'
+  ].join('\n');
+
+  html = html.replace(/<style>[\s\S]*?<\/style>/, sidebarStyle);
+  html = html.replace('<body>', '<body>\n' + tocHtml + '\n<div id="main-content">' + docTitleBanner);
+  html = html.replace('</body>', '</div>\n' + scrollScript + '\n</body>');
+
+  // Merge consecutive lists
+  html = html.replace(/<\/ol>\n<ol>/g, '');
+  html = html.replace(/<\/ul>\n<ul>/g, '');
+
+  // Wrap tables
+  html = html.replace(/<table/g, '<div class="table-wrapper"><table');
+  html = html.replace(/<\/table>/g, '</table></div>');
+
+  const finalPath = path.join(OUTPUT_DIR, 'page_final.html');
+  fs.writeFileSync(finalPath, html, 'utf-8');
+  console.log(`  ✓ HTML: ${finalPath} (${(Buffer.byteLength(html) / 1024).toFixed(0)} KB)`);
+
+  // === Generate Markdown ===
+  let md = '';
+  if (docTitle && firstHeadingText !== docTitle) md += '# ' + docTitle + '\n\n';
+  for (const block of blocks) {
+    const plainText = (block.content || '')
+      .replace(/<br\s*\/?>/g, '\n')
+      .replace(/<\/?(strong|b)>/g, '**')
+      .replace(/<\/?(em|i)>/g, '*')
+      .replace(/<a[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/g, '[$2]($1)')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\u200b/g, '')
+      .trim();
+
+    switch (block.type) {
+      case 'heading': {
+        const prefix = '#'.repeat(Math.min(6, Math.max(1, block.level || 2)));
+        md += '\n' + prefix + ' ' + plainText + '\n\n';
+        break;
+      }
+      case 'image': {
+        const src = imgMap[block.imgSrc] || block.imgSrc;
+        md += '![](' + src + ')\n\n';
+        break;
+      }
+      case 'images': {
+        const srcMatches = (block.content || '').match(/src="([^"]+)"/g) || [];
+        for (const m of srcMatches) {
+          let url = m.replace('src="', '').replace('"', '');
+          url = imgMap[url] || url;
+          md += '![](' + url + ') ';
+        }
+        md += '\n\n';
+        break;
+      }
+      case 'code':
+        md += '```\n' + plainText + '\n```\n\n';
+        break;
+      case 'quote':
+        md += plainText.split('\n').map(function(l) { return '> ' + l; }).join('\n') + '\n\n';
+        break;
+      case 'table':
+        md += plainText + '\n\n';
+        break;
+      case 'ol':
+        md += '1. ' + plainText + '\n';
+        break;
+      case 'ul':
+        md += '- ' + plainText + '\n';
+        break;
+      default:
+        if (plainText) md += plainText + '\n\n';
+        break;
+    }
+  }
+  const mdPath = path.join(OUTPUT_DIR, 'page.md');
+  fs.writeFileSync(mdPath, md.trim(), 'utf-8');
+  console.log('  ✓ Markdown: ' + mdPath + ' (' + (Buffer.byteLength(md) / 1024).toFixed(0) + ' KB)');
+
+  console.log('\n===== 全部完成！=====');
+  console.log('内容块: ' + blocks.length + ', 图片: ' + Object.keys(imgMap).length);
+
+  await page.waitForTimeout(3000);
+  await browser.close();
+})();
