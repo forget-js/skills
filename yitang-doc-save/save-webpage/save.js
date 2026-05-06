@@ -94,6 +94,149 @@ function extractBlockContent() {
     return styles.length ? styles.join('; ') : '';
   }
 
+  function getCellComputedStyles(el) {
+    const cs = getComputedStyle(el);
+    const styles = [];
+
+    const bg = cs.backgroundColor;
+    if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && bg !== 'rgb(255, 255, 255)') {
+      styles.push(`background-color: ${bg}`);
+    }
+
+    const color = cs.color;
+    if (color && color !== 'rgb(51, 51, 51)' && color !== 'rgb(0, 0, 0)' && color !== 'rgba(0, 0, 0, 0)') {
+      styles.push(`color: ${color}`);
+    }
+
+    const fw = cs.fontWeight;
+    if (fw !== '400' && fw !== 'normal') {
+      styles.push(`font-weight: ${fw}`);
+    }
+
+    const fs = parseInt(cs.fontSize);
+    if (fs && fs !== 16 && fs !== 15) {
+      styles.push(`font-size: ${fs}px`);
+    }
+
+    const ta = cs.textAlign;
+    if (ta && ta !== 'start' && ta !== 'left') {
+      styles.push(`text-align: ${ta}`);
+    }
+
+    const va = cs.verticalAlign;
+    if (va && va !== 'middle' && va !== 'baseline') {
+      styles.push(`vertical-align: ${va}`);
+    }
+
+    const ws = cs.whiteSpace;
+    if (ws && ws !== 'normal') {
+      styles.push(`white-space: ${ws}`);
+    }
+
+    const defBorder = '1px solid rgb(221, 221, 221)';
+    const bt = `${cs.borderTopWidth} ${cs.borderTopStyle} ${cs.borderTopColor}`;
+    const br = `${cs.borderRightWidth} ${cs.borderRightStyle} ${cs.borderRightColor}`;
+    const bb = `${cs.borderBottomWidth} ${cs.borderBottomStyle} ${cs.borderBottomColor}`;
+    const bl = `${cs.borderLeftWidth} ${cs.borderLeftStyle} ${cs.borderLeftColor}`;
+
+    if (bt === br && bt === bb && bt === bl) {
+      if (bt !== defBorder && !bt.startsWith('0px')) {
+        styles.push(`border: ${bt}`);
+      }
+    } else {
+      if (!bt.startsWith('0px') && bt !== defBorder) styles.push(`border-top: ${bt}`);
+      if (!br.startsWith('0px') && br !== defBorder) styles.push(`border-right: ${br}`);
+      if (!bb.startsWith('0px') && bb !== defBorder) styles.push(`border-bottom: ${bb}`);
+      if (!bl.startsWith('0px') && bl !== defBorder) styles.push(`border-left: ${bl}`);
+    }
+
+    const pad = cs.padding;
+    if (pad && pad !== '0px' && pad !== '8px 12px') {
+      styles.push(`padding: ${pad}`);
+    }
+
+    return styles.length ? styles.join('; ') : '';
+  }
+
+  function processTable(tableEl) {
+    function buildTableHTML(el) {
+      if (el.nodeType === 3) return el.textContent;
+      if (el.nodeType !== 1) return '';
+
+      const tag = el.tagName.toLowerCase();
+      if (['script', 'style', 'template'].includes(tag)) return '';
+
+      if (tag === 'table') {
+        let childrenHTML = '';
+        for (const child of el.childNodes) {
+          childrenHTML += buildTableHTML(child);
+        }
+        return `<table style="width: 100%; border-collapse: collapse; table-layout: auto;">${childrenHTML}</table>`;
+      }
+
+      if (['thead', 'tbody', 'tfoot', 'tr'].includes(tag)) {
+        let childrenHTML = '';
+        for (const child of el.childNodes) {
+          childrenHTML += buildTableHTML(child);
+        }
+        return `<${tag}>${childrenHTML}</${tag}>`;
+      }
+
+      if (tag === 'th' || tag === 'td') {
+        const colspan = el.getAttribute('colspan');
+        const rowspan = el.getAttribute('rowspan');
+        let attrs = '';
+        if (colspan) attrs += ` colspan="${colspan}"`;
+        if (rowspan) attrs += ` rowspan="${rowspan}"`;
+
+        const cellStyle = getCellComputedStyles(el);
+        if (cellStyle) attrs += ` style="${cellStyle}"`;
+
+        let childrenHTML = '';
+        for (const child of el.childNodes) {
+          childrenHTML += cleanHTML(child);
+        }
+
+        return `<${tag}${attrs}>${childrenHTML}</${tag}>`;
+      }
+
+      if (tag === 'colgroup') {
+        let childrenHTML = '';
+        for (const child of el.childNodes) {
+          childrenHTML += buildTableHTML(child);
+        }
+        return `<colgroup>${childrenHTML}</colgroup>`;
+      }
+
+      if (tag === 'col') {
+        let attrs = '';
+        const span = el.getAttribute('span');
+        const width = el.getAttribute('width');
+        const styleAttr = el.getAttribute('style');
+        if (span) attrs += ` span="${span}"`;
+        if (width) attrs += ` width="${width}"`;
+        if (styleAttr) attrs += ` style="${styleAttr}"`;
+        return `<col${attrs}>`;
+      }
+
+      if (tag === 'caption') {
+        let childrenHTML = '';
+        for (const child of el.childNodes) {
+          childrenHTML += cleanHTML(child);
+        }
+        return `<caption>${childrenHTML}</caption>`;
+      }
+
+      let childrenHTML = '';
+      for (const child of el.childNodes) {
+        childrenHTML += buildTableHTML(child);
+      }
+      return childrenHTML;
+    }
+
+    return buildTableHTML(tableEl);
+  }
+
   function cleanHTML(el) {
     if (el.nodeType === 3) return el.textContent;
     if (el.nodeType !== 1) return '';
@@ -179,15 +322,7 @@ function extractBlockContent() {
       type = 'table';
       const table = item.querySelector('table');
       if (table) {
-        // Use original innerHTML, only strip class/data attributes, keep style
-        let tableHtml = table.outerHTML;
-        tableHtml = tableHtml.replace(/\s+class="[^"]*"/g, '');
-        tableHtml = tableHtml.replace(/\s+data-[a-z-]+="[^"]*"/g, '');
-        // Ensure table fits in container
-        tableHtml = tableHtml.replace(/<table/, '<table style="width: 100%; border-collapse: collapse; table-layout: auto;"');
-        // Constrain images within table cells
-        tableHtml = tableHtml.replace(/<img /g, '<img style="max-width: 200px; height: auto; display: inline-block; vertical-align: top; margin: 2px;" ');
-        content = tableHtml;
+        content = processTable(table);
       }
     } else {
       // Text / heading / list
@@ -587,6 +722,9 @@ function escapeAttr(text) {
     code { font-family: "Fira Code", Consolas, monospace; }
     blockquote { border-left: 4px solid #ddd; margin: 1em 0; padding: 0.5em 1em; color: #555; background: #fafafa; border-radius: 0 4px 4px 0; }
     .table-wrapper { overflow-x: auto; margin: 1em 0; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+    th { background: #f5f5f5; font-weight: 600; }
     td img, th img { max-width: 100%; height: auto; }
     ul, ol { margin: 0.5em 0; padding-left: 2em; }
     li { margin: 0.3em 0; }

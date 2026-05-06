@@ -5,5 +5,7 @@ GO
 *.log
 .DS_Store
 Thumbs.db
-.claude/settings.local.json
+.claude/
 .vscode/
+/save-webpage/
+/🎯一堂行动营：调研黑客五步曲实操篇/
