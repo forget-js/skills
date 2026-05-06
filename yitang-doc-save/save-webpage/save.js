@@ -193,8 +193,89 @@ function extractBlockContent() {
         if (cellStyle) attrs += ` style="${cellStyle}"`;
 
         let childrenHTML = '';
-        for (const child of el.childNodes) {
-          childrenHTML += cleanHTML(child);
+        const wrappers = el.querySelectorAll('.render-unit-wrapper');
+
+        if (wrappers.length > 0) {
+          const blocks = [];
+          wrappers.forEach(w => {
+            w.querySelectorAll('.block').forEach(b => blocks.push(b));
+          });
+
+          let inOl = false, inUl = false;
+          let inGrid = false;
+          let gridImages = [];
+
+          function flushGrid() {
+            if (gridImages.length > 0) {
+              if (childrenHTML) childrenHTML += '<br>';
+              childrenHTML += gridImages.join('');
+              gridImages = [];
+            }
+            inGrid = false;
+          }
+
+          function flushLists() {
+            if (inOl) { childrenHTML += '</ol>'; inOl = false; }
+            if (inUl) { childrenHTML += '</ul>'; inUl = false; }
+          }
+
+          for (let i = 0; i < blocks.length; i++) {
+            const block = blocks[i];
+            const cls = block.className || '';
+
+            if (cls.includes('docx-ordered-block')) {
+              flushGrid();
+              if (inUl) { childrenHTML += '</ul>'; inUl = false; }
+              if (!inOl) { childrenHTML += '<ol>'; inOl = true; }
+              childrenHTML += '<li>' + cleanHTML(block) + '</li>';
+            } else if (cls.includes('docx-bulleted-block') || cls.includes('docx-unordered-block')) {
+              flushGrid();
+              if (inOl) { childrenHTML += '</ol>'; inOl = false; }
+              if (!inUl) { childrenHTML += '<ul>'; inUl = true; }
+              childrenHTML += '<li>' + cleanHTML(block) + '</li>';
+            } else if (cls.includes('docx-grid-block')) {
+              flushGrid();
+              flushLists();
+              if (block.querySelector('.grid-horizontal')) {
+                inGrid = true;
+              }
+            } else if (cls.includes('docx-grid_column-block')) {
+              // Structural wrapper, skip
+            } else if (cls.includes('docx-image-block')) {
+              flushLists();
+              const img = block.querySelector('img');
+              if (img) {
+                const imgHTML = cleanHTML(img);
+                if (inGrid) {
+                  gridImages.push(imgHTML);
+                } else {
+                  if (childrenHTML) childrenHTML += '<br>';
+                  childrenHTML += imgHTML;
+                }
+              }
+              if (inGrid) {
+                const nextCls = i + 1 < blocks.length ? blocks[i + 1].className || '' : '';
+                if (!nextCls.includes('docx-image-block') && !nextCls.includes('docx-grid_column-block')) {
+                  flushGrid();
+                }
+              }
+            } else {
+              flushGrid();
+              flushLists();
+              const html = cleanHTML(block);
+              if (html.trim()) {
+                if (childrenHTML) childrenHTML += '<br>';
+                childrenHTML += html;
+              }
+            }
+          }
+
+          flushGrid();
+          flushLists();
+        } else {
+          for (const child of el.childNodes) {
+            childrenHTML += cleanHTML(child);
+          }
         }
 
         return `<${tag}${attrs}>${childrenHTML}</${tag}>`;
@@ -247,7 +328,7 @@ function extractBlockContent() {
     if (tag === 'img') {
       const src = el.getAttribute('src') || '';
       if (!src) return '';
-      return `<img src="${src}" alt="" loading="lazy">`;
+      return `<img src="${src}" alt="" loading="lazy" style="display: inline-block; vertical-align: top;">`;
     }
 
     let childrenHTML = '';
@@ -270,6 +351,10 @@ function extractBlockContent() {
       const href = el.getAttribute('href') || '';
       return `<a href="${href}" target="_blank">${childrenHTML}</a>`;
     }
+
+    if (tag === 'ul') return `<ul>${childrenHTML}</ul>`;
+    if (tag === 'ol') return `<ol>${childrenHTML}</ol>`;
+    if (tag === 'li') return `<li>${childrenHTML}</li>`;
 
     return childrenHTML;
   }
@@ -452,6 +537,16 @@ async function scrollAndExtract(page) {
         }
         // Collect image URLs from multi-image content
         if (block.type === 'images' && block.content) {
+          const srcMatches = block.content.match(/src="([^"]+)"/g);
+          if (srcMatches) {
+            srcMatches.forEach(m => {
+              const url = m.replace('src="', '').replace('"', '');
+              if (!url.startsWith('data:')) allImageUrls.add(url);
+            });
+          }
+        }
+        // Collect image URLs from table blocks
+        if (block.type === 'table' && block.content) {
           const srcMatches = block.content.match(/src="([^"]+)"/g);
           if (srcMatches) {
             srcMatches.forEach(m => {
