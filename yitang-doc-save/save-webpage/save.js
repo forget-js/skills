@@ -26,6 +26,61 @@ if (!OUTPUT_NAME_ARG) {
 const SIGNAL_FILE = path.join(SAVE_ROOT, 'GO');
 const USER_DATA_DIR = path.join(SAVE_ROOT, 'browser-data');
 
+/** 块内容去标签，用于匹配「一堂活动信息」等标题 */
+function stripBlockText(html) {
+  return (html || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\u200b/g, '')
+    .replace(/&#8203;/g, '')
+    .trim();
+}
+
+/** 是否视为「一堂活动信息」版块起始块（避免正文偶然提及误截断） */
+function matchesYitangActivityHeader(b) {
+  const t = stripBlockText(b.content);
+  if (!t.includes('一堂活动信息')) return false;
+  const pos = t.indexOf('一堂活动信息');
+  if (pos > 40) return false;
+  if (b.type === 'heading') return true;
+  if (t.length <= 120) return true;
+  return false;
+}
+
+/** 丢弃从「一堂活动信息」标题起的文末区块 */
+function sliceBeforeYitangActivitySection(blocks) {
+  if (!blocks || !blocks.length) return blocks;
+  const idx = blocks.findIndex(matchesYitangActivityHeader);
+  if (idx === -1) return blocks;
+  return blocks.slice(0, idx);
+}
+
+function collectImageUrlsFromBlocks(blocks) {
+  const set = new Set();
+  for (const block of blocks) {
+    if (block.imgSrc && !block.imgSrc.startsWith('data:')) set.add(block.imgSrc);
+    if (block.type === 'images' && block.content) {
+      const srcMatches = block.content.match(/src="([^"]+)"/g);
+      if (srcMatches) {
+        srcMatches.forEach(m => {
+          const url = m.replace('src="', '').replace('"', '');
+          if (!url.startsWith('data:')) set.add(url);
+        });
+      }
+    }
+    if (block.type === 'table' && block.content) {
+      const srcMatches = block.content.match(/src="([^"]+)"/g);
+      if (srcMatches) {
+        srcMatches.forEach(m => {
+          const url = m.replace('src="', '').replace('"', '');
+          if (!url.startsWith('data:')) set.add(url);
+        });
+      }
+    }
+  }
+  return [...set];
+}
+
 function sanitizeForDir(name) {
   if (!name || typeof name !== 'string') return '';
   const s = name
@@ -169,9 +224,10 @@ function extractBlockContent() {
       if (tag === 'table') {
         let childrenHTML = '';
         for (const child of el.childNodes) {
+          if (child.nodeType === 1 && child.tagName.toLowerCase() === 'colgroup') continue;
           childrenHTML += buildTableHTML(child);
         }
-        return `<table style="width: 100%; border-collapse: collapse; table-layout: auto;">${childrenHTML}</table>`;
+        return `<table style="width: 100%; border-collapse: collapse; table-layout: fixed;">${childrenHTML}</table>`;
       }
 
       if (['thead', 'tbody', 'tfoot', 'tr'].includes(tag)) {
@@ -195,23 +251,53 @@ function extractBlockContent() {
         let childrenHTML = '';
         const wrappers = el.querySelectorAll('.render-unit-wrapper');
 
+        /** 同一单元格内相同 src 的图片往往来自嵌套块重复采集，仅保留首次 */
+        function dedupeImgTagsBySrc(html) {
+          if (!html) return html;
+          const seen = new Set();
+          return html.replace(/<img\b[^>]*>/gi, (tag) => {
+            const m = tag.match(/\ssrc="([^"]+)"/i);
+            if (!m) return tag;
+            const src = m[1];
+            if (seen.has(src)) return '';
+            seen.add(src);
+            return tag;
+          });
+        }
+
         if (wrappers.length > 0) {
           const blocks = [];
           wrappers.forEach(w => {
             w.querySelectorAll('.block').forEach(b => blocks.push(b));
           });
 
-          let inOl = false, inUl = false;
-          let inGrid = false;
-          let gridImages = [];
-
-          function flushGrid() {
-            if (gridImages.length > 0) {
-              if (childrenHTML) childrenHTML += '<br>';
-              childrenHTML += gridImages.join('');
-              gridImages = [];
+          /** 避免嵌套 .block 重复输出：父级 cleanHTML 已含子块内容则跳过后续子块下标 */
+          const skipBlock = new Set();
+          function markSkipNested(i) {
+            const root = blocks[i];
+            for (let j = 0; j < blocks.length; j++) {
+              if (j === i || skipBlock.has(j)) continue;
+              if (root.contains(blocks[j])) skipBlock.add(j);
             }
-            inGrid = false;
+          }
+
+          let inOl = false, inUl = false;
+          /** 同一单元格内待输出的图片序列；与源站「一行多图」一致 */
+          const imgAccum = [];
+          /** 处于横向 docx-grid 内时，单张图也包进 yitang-td-img-row，避免与 column 组合时断行 */
+          let gridHorizontalActive = false;
+
+          function flushImgAccum() {
+            if (imgAccum.length === 0) return;
+            if (childrenHTML) childrenHTML += '<br>';
+            const useRow = imgAccum.length >= 2 || (imgAccum.length >= 1 && gridHorizontalActive);
+            if (useRow) {
+              childrenHTML += '<span class="yitang-td-img-row">' + imgAccum.join('') + '</span>';
+            } else {
+              childrenHTML += imgAccum.join('');
+            }
+            imgAccum.length = 0;
+            gridHorizontalActive = false;
           }
 
           function flushLists() {
@@ -219,58 +305,61 @@ function extractBlockContent() {
             if (inUl) { childrenHTML += '</ul>'; inUl = false; }
           }
 
+          function gridBlockIsHorizontal(el) {
+            if (el.querySelector('.grid-horizontal')) return true;
+            const g = el.querySelector('[class*="grid"]');
+            if (g && (g.className.includes('horizontal') || g.className.includes('row'))) return true;
+            try {
+              const cs = getComputedStyle(el);
+              if (cs.display === 'flex' && (cs.flexDirection === 'row' || cs.flexDirection === 'row-reverse')) return true;
+            } catch (e) {}
+            return false;
+          }
+
           for (let i = 0; i < blocks.length; i++) {
+            if (skipBlock.has(i)) continue;
             const block = blocks[i];
             const cls = block.className || '';
 
             if (cls.includes('docx-ordered-block')) {
-              flushGrid();
+              gridHorizontalActive = false;
+              flushImgAccum();
               if (inUl) { childrenHTML += '</ul>'; inUl = false; }
               if (!inOl) { childrenHTML += '<ol>'; inOl = true; }
               childrenHTML += '<li>' + cleanHTML(block) + '</li>';
+              markSkipNested(i);
             } else if (cls.includes('docx-bulleted-block') || cls.includes('docx-unordered-block')) {
-              flushGrid();
+              gridHorizontalActive = false;
+              flushImgAccum();
               if (inOl) { childrenHTML += '</ol>'; inOl = false; }
               if (!inUl) { childrenHTML += '<ul>'; inUl = true; }
               childrenHTML += '<li>' + cleanHTML(block) + '</li>';
+              markSkipNested(i);
             } else if (cls.includes('docx-grid-block')) {
-              flushGrid();
+              flushImgAccum();
               flushLists();
-              if (block.querySelector('.grid-horizontal')) {
-                inGrid = true;
-              }
+              gridHorizontalActive = gridBlockIsHorizontal(block);
             } else if (cls.includes('docx-grid_column-block')) {
-              // Structural wrapper, skip
+              // 占位结构，不 flush 图片以便横栅格内多图连续收集
             } else if (cls.includes('docx-image-block')) {
               flushLists();
               const img = block.querySelector('img');
-              if (img) {
-                const imgHTML = cleanHTML(img);
-                if (inGrid) {
-                  gridImages.push(imgHTML);
-                } else {
-                  if (childrenHTML) childrenHTML += '<br>';
-                  childrenHTML += imgHTML;
-                }
-              }
-              if (inGrid) {
-                const nextCls = i + 1 < blocks.length ? blocks[i + 1].className || '' : '';
-                if (!nextCls.includes('docx-image-block') && !nextCls.includes('docx-grid_column-block')) {
-                  flushGrid();
-                }
-              }
+              if (img) imgAccum.push(cleanHTML(img));
+              markSkipNested(i);
             } else {
-              flushGrid();
+              gridHorizontalActive = false;
+              flushImgAccum();
               flushLists();
               const html = cleanHTML(block);
               if (html.trim()) {
                 if (childrenHTML) childrenHTML += '<br>';
                 childrenHTML += html;
               }
+              markSkipNested(i);
             }
           }
 
-          flushGrid();
+          flushImgAccum();
           flushLists();
         } else {
           for (const child of el.childNodes) {
@@ -278,7 +367,7 @@ function extractBlockContent() {
           }
         }
 
-        return `<${tag}${attrs}>${childrenHTML}</${tag}>`;
+        return `<${tag}${attrs}>${dedupeImgTagsBySrc(childrenHTML)}</${tag}>`;
       }
 
       if (tag === 'colgroup') {
@@ -315,7 +404,111 @@ function extractBlockContent() {
       return childrenHTML;
     }
 
-    return buildTableHTML(tableEl);
+    /** 部分课件右侧「幽灵列」裁剪（仅限 clone）。
+     * 历史：（1）输出丢弃 colgroup —— 行列数仍为 5 时仍会出 5 列；（2）按 trailing 空格格删列 —— 「空」格含零宽/占位 img 时用 textContent=='' 误判为非空→trim=0。
+     * 假设：幽灵格多为单列且无合并；用「语义空」判定（清零宽字符、忽略小图/svg）可提高 trim 命中率且不删正文列。 */
+    function trimTrailingGhostColumns(table) {
+      if (!table || table.tagName.toLowerCase() !== 'table') return;
+      const rows = table.querySelectorAll('tr');
+      if (!rows.length) return;
+
+      function scopeCells(tr) {
+        return Array.from(tr.children).filter(c => {
+          const t = c.tagName && c.tagName.toLowerCase();
+          return t === 'td' || t === 'th';
+        });
+      }
+      function cellSemanticEmpty(c) {
+        const raw = (c.innerText != null ? c.innerText : c.textContent) || '';
+        const t = raw
+          .replace(/[\u200b-\u200d\u2060-\u2064\u2066-\u2069\ufeff\u00ad\u034f]/g, '')
+          .replace(/[\s\u00a0\u3000]+/g, '')
+          .trim();
+        if (t) return false;
+
+        const imgs = c.querySelectorAll('img');
+        for (const im of imgs) {
+          let w = im.naturalWidth || 0;
+          let h = im.naturalHeight || 0;
+          if ((!w || !h) && (im.width || im.height)) {
+            w = Number(im.width) || w;
+            h = Number(im.height) || h;
+          }
+          if (!w) w = parseInt(im.getAttribute('width') || '0', 10) || 0;
+          if (!h) h = parseInt(im.getAttribute('height') || '0', 10) || 0;
+          if ((!w || !h) && im.getAttribute('src')) continue;
+          if (!im.getAttribute('src')) return false;
+          if (w > 24 || h > 24) return false;
+        }
+
+        const svgs = c.querySelectorAll('svg');
+        for (let si = 0; si < svgs.length; si++) {
+          const box = svgs[si].getBoundingClientRect();
+          if (box.width > 36 || box.height > 36) return false;
+        }
+
+        if (c.querySelector('iframe,canvas,video,embed,picture')) return false;
+        return true;
+      }
+
+      /** 仅删除单列无 rowspan/colspan；顶行大单格单独减 colspan */
+      function cellPlainForRemove(c) {
+        const rs = c.getAttribute('rowspan');
+        if (rs && parseInt(rs, 10) > 1) return false;
+        const cs = c.getAttribute('colspan');
+        if (cs && parseInt(cs, 10) > 1) return false;
+        return true;
+      }
+
+      const counts = Array.from(rows, tr => scopeCells(tr).length);
+      const maxC = Math.max(...counts);
+      const fullRows = Array.from(rows).filter(tr => scopeCells(tr).length === maxC);
+      if (!fullRows.length) return;
+
+      let trim = 0;
+      for (let col = maxC - 1; col >= 0; col--) {
+        let allEmpty = true;
+        for (let i = 0; i < fullRows.length; i++) {
+          const cells = scopeCells(fullRows[i]);
+          if (col >= cells.length) {
+            allEmpty = false;
+            break;
+          }
+          const cell = cells[col];
+          if (!cellSemanticEmpty(cell) || !cellPlainForRemove(cell)) {
+            allEmpty = false;
+            break;
+          }
+        }
+        if (allEmpty) trim++;
+        else break;
+      }
+      if (trim === 0) return;
+
+      for (let r = 0; r < rows.length; r++) {
+        const tr = rows[r];
+        const cells = scopeCells(tr);
+        if (cells.length === maxC) {
+          for (let k = 0; k < trim; k++) {
+            const cur = scopeCells(tr);
+            const idx = cur.length - 1;
+            if (idx < 0) break;
+            const c = cur[idx];
+            if (cellSemanticEmpty(c) && cellPlainForRemove(c)) c.remove();
+          }
+        } else if (cells.length === 1) {
+          const one = cells[0];
+          const cs = parseInt(one.getAttribute('colspan') || '1', 10);
+          if (cs === maxC && (!one.getAttribute('rowspan') || parseInt(one.getAttribute('rowspan'), 10) <= 1)) {
+            one.setAttribute('colspan', String(cs - trim));
+          }
+        }
+      }
+    }
+
+    const clone = tableEl.cloneNode(true);
+    trimTrailingGhostColumns(clone);
+    return buildTableHTML(clone);
   }
 
   function cleanHTML(el) {
@@ -328,7 +521,7 @@ function extractBlockContent() {
     if (tag === 'img') {
       const src = el.getAttribute('src') || '';
       if (!src) return '';
-      return `<img src="${src}" alt="" loading="lazy" style="display: inline-block; vertical-align: top;">`;
+      return `<img class="yitang-doc-img" src="${src}" alt="" loading="lazy" style="max-width:100%;height:auto;display:inline-block;vertical-align:top;box-sizing:border-box;">`;
     }
 
     let childrenHTML = '';
@@ -519,7 +712,6 @@ async function scrollAndExtract(page) {
   console.log(`  页面总高度: ${totalHeight}px, 步长: ${stepSize}px`);
 
   const allBlocks = new Map();
-  const allImageUrls = new Set();
   let step = 0;
   const totalSteps = Math.ceil(totalHeight / stepSize);
 
@@ -532,40 +724,25 @@ async function scrollAndExtract(page) {
     for (const block of blocks) {
       if (!allBlocks.has(block.itemId)) {
         allBlocks.set(block.itemId, block);
-        if (block.imgSrc && !block.imgSrc.startsWith('data:')) {
-          allImageUrls.add(block.imgSrc);
-        }
-        // Collect image URLs from multi-image content
-        if (block.type === 'images' && block.content) {
-          const srcMatches = block.content.match(/src="([^"]+)"/g);
-          if (srcMatches) {
-            srcMatches.forEach(m => {
-              const url = m.replace('src="', '').replace('"', '');
-              if (!url.startsWith('data:')) allImageUrls.add(url);
-            });
-          }
-        }
-        // Collect image URLs from table blocks
-        if (block.type === 'table' && block.content) {
-          const srcMatches = block.content.match(/src="([^"]+)"/g);
-          if (srcMatches) {
-            srcMatches.forEach(m => {
-              const url = m.replace('src="', '').replace('"', '');
-              if (!url.startsWith('data:')) allImageUrls.add(url);
-            });
-          }
-        }
       }
     }
 
     step++;
     if (step % 15 === 0) {
-      console.log(`  进度: ${Math.min(100, Math.round(scrollY / totalHeight * 100))}% (${allBlocks.size} 块, ${allImageUrls.size} 图片)`);
+      console.log(`  进度: ${Math.min(100, Math.round(scrollY / totalHeight * 100))}% (${allBlocks.size} 块)`);
     }
   }
 
-  console.log(`  ✓ 采集完成: ${allBlocks.size} 个内容块, ${allImageUrls.size} 张图片`);
-  return { blocks: [...allBlocks.values()], imageUrls: [...allImageUrls] };
+  let blockArray = [...allBlocks.values()];
+  const nBeforeTrim = blockArray.length;
+  blockArray = sliceBeforeYitangActivitySection(blockArray);
+  if (blockArray.length < nBeforeTrim) {
+    console.log(`  ℹ 已忽略文末「一堂活动信息」起 ${nBeforeTrim - blockArray.length} 个内容块`);
+  }
+
+  const imageUrls = collectImageUrlsFromBlocks(blockArray);
+  console.log(`  ✓ 采集完成: ${blockArray.length} 个内容块, ${imageUrls.length} 张图片`);
+  return { blocks: blockArray, imageUrls };
 }
 
 async function downloadImages(page, imageUrls, imgDir) {
@@ -817,10 +994,33 @@ function escapeAttr(text) {
     code { font-family: "Fira Code", Consolas, monospace; }
     blockquote { border-left: 4px solid #ddd; margin: 1em 0; padding: 0.5em 1em; color: #555; background: #fafafa; border-radius: 0 4px 4px 0; }
     .table-wrapper { overflow-x: auto; margin: 1em 0; }
+    .table-wrapper table { table-layout: fixed; }
     table { border-collapse: collapse; width: 100%; }
-    td, th { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+    td, th { border: 1px solid #ddd; padding: 8px 12px; text-align: left; word-wrap: break-word; overflow-wrap: anywhere; }
     th { background: #f5f5f5; font-weight: 600; }
-    td img, th img { max-width: 100%; height: auto; }
+    td img, th img { max-width: 100%; height: auto; vertical-align: top; }
+    #main-content .table-wrapper td .yitang-td-img-row,
+    #main-content .table-wrapper th .yitang-td-img-row {
+      display: flex;
+      flex-direction: row;
+      flex-wrap: nowrap;
+      align-items: flex-start;
+      justify-content: flex-start;
+      gap: 8px;
+      max-width: 100%;
+      min-width: 0;
+      vertical-align: top;
+    }
+    #main-content .table-wrapper td .yitang-td-img-row img,
+    #main-content .table-wrapper th .yitang-td-img-row img {
+      flex: 1 1 0;
+      min-width: 0;
+      width: auto;
+      max-width: none;
+      height: auto;
+      object-fit: contain;
+      box-sizing: border-box;
+    }
     ul, ol { margin: 0.5em 0; padding-left: 2em; }
     li { margin: 0.3em 0; }
     @media (max-width: 900px) { #sidebar-toc { display: none; } #main-content { margin-left: 0; padding: 20px; } }
@@ -1195,6 +1395,7 @@ function escapeAttr(text) {
   console.log('\n===== 全部完成！=====');
   console.log('内容块: ' + blocks.length + ', 图片: ' + Object.keys(imgMap).length);
 
-  await page.waitForTimeout(3000);
+  console.log('\n（约 8 秒后自动关闭浏览器窗口；勿手动关，以免误以为保存失败。）');
+  await page.waitForTimeout(8000);
   await browser.close();
 })();
