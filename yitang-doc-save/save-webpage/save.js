@@ -405,19 +405,13 @@ function extractBlockContent() {
     }
 
     /** 部分课件右侧「幽灵列」裁剪（仅限 clone）。
-     * 历史：（1）输出丢弃 colgroup —— 行列数仍为 5 时仍会出 5 列；（2）按 trailing 空格格删列 —— 「空」格含零宽/占位 img 时用 textContent=='' 误判为非空→trim=0。
-     * 假设：幽灵格多为单列且无合并；用「语义空」判定（清零宽字符、忽略小图/svg）可提高 trim 命中率且不删正文列。 */
+     * 按「表格网格」识别列：有 colspan/rowspan 时用 DOM 子格下标当列会错位，导致幽灵列删不掉。
+     * 自右向左若某网格列上出现的所有单元格均语义空，则整列视为幽灵列；再删格或减小 colspan。 */
     function trimTrailingGhostColumns(table) {
       if (!table || table.tagName.toLowerCase() !== 'table') return;
-      const rows = table.querySelectorAll('tr');
+      const rows = Array.from(table.rows);
       if (!rows.length) return;
 
-      function scopeCells(tr) {
-        return Array.from(tr.children).filter(c => {
-          const t = c.tagName && c.tagName.toLowerCase();
-          return t === 'td' || t === 'th';
-        });
-      }
       function cellSemanticEmpty(c) {
         const raw = (c.innerText != null ? c.innerText : c.textContent) || '';
         const t = raw
@@ -451,31 +445,54 @@ function extractBlockContent() {
         return true;
       }
 
-      /** 仅删除单列无 rowspan/colspan；顶行大单格单独减 colspan */
-      function cellPlainForRemove(c) {
-        const rs = c.getAttribute('rowspan');
-        if (rs && parseInt(rs, 10) > 1) return false;
-        const cs = c.getAttribute('colspan');
-        if (cs && parseInt(cs, 10) > 1) return false;
-        return true;
+      function buildTableGrid() {
+        const grid = [];
+        const cellMeta = new WeakMap();
+        for (let r = 0; r < rows.length; r++) {
+          if (!grid[r]) grid[r] = [];
+          let c = 0;
+          const row = rows[r];
+          for (let i = 0; i < row.cells.length; i++) {
+            const cell = row.cells[i];
+            const rs = cell.rowSpan || 1;
+            const cs = cell.colSpan || 1;
+            while (grid[r][c]) c++;
+            if (!cellMeta.has(cell)) {
+              cellMeta.set(cell, { startCol: c, startRow: r, colSpan: cs, rowSpan: rs });
+            }
+            for (let dr = 0; dr < rs; dr++) {
+              for (let dc = 0; dc < cs; dc++) {
+                const rr = r + dr;
+                if (!grid[rr]) grid[rr] = [];
+                grid[rr][c + dc] = cell;
+              }
+            }
+            c += cs;
+          }
+        }
+        let colCount = 0;
+        for (let r = 0; r < grid.length; r++) {
+          if (!grid[r]) continue;
+          for (let cc = 0; cc < grid[r].length; cc++) {
+            if (grid[r][cc]) colCount = Math.max(colCount, cc + 1);
+          }
+        }
+        return { grid, colCount, cellMeta };
       }
 
-      const counts = Array.from(rows, tr => scopeCells(tr).length);
-      const maxC = Math.max(...counts);
-      const fullRows = Array.from(rows).filter(tr => scopeCells(tr).length === maxC);
-      if (!fullRows.length) return;
+      const { grid, colCount, cellMeta } = buildTableGrid();
+      if (colCount < 1) return;
 
       let trim = 0;
-      for (let col = maxC - 1; col >= 0; col--) {
+      for (let col = colCount - 1; col >= 0; col--) {
+        const seen = new Set();
+        for (let r = 0; r < rows.length; r++) {
+          if (grid[r] && grid[r][col]) seen.add(grid[r][col]);
+        }
+        if (seen.size === 0) break;
         let allEmpty = true;
-        for (let i = 0; i < fullRows.length; i++) {
-          const cells = scopeCells(fullRows[i]);
-          if (col >= cells.length) {
-            allEmpty = false;
-            break;
-          }
-          const cell = cells[col];
-          if (!cellSemanticEmpty(cell) || !cellPlainForRemove(cell)) {
+        for (const cell of seen) {
+          if (!cellSemanticEmpty(cell)) {
             allEmpty = false;
             break;
           }
@@ -483,26 +500,39 @@ function extractBlockContent() {
         if (allEmpty) trim++;
         else break;
       }
-      if (trim === 0) return;
 
+      const newColCount = colCount - trim;
+      if (trim === 0 || newColCount < 1) return;
+
+      const toRemove = [];
+      const toUpdate = [];
+      const seenCell = new Set();
       for (let r = 0; r < rows.length; r++) {
-        const tr = rows[r];
-        const cells = scopeCells(tr);
-        if (cells.length === maxC) {
-          for (let k = 0; k < trim; k++) {
-            const cur = scopeCells(tr);
-            const idx = cur.length - 1;
-            if (idx < 0) break;
-            const c = cur[idx];
-            if (cellSemanticEmpty(c) && cellPlainForRemove(c)) c.remove();
-          }
-        } else if (cells.length === 1) {
-          const one = cells[0];
-          const cs = parseInt(one.getAttribute('colspan') || '1', 10);
-          if (cs === maxC && (!one.getAttribute('rowspan') || parseInt(one.getAttribute('rowspan'), 10) <= 1)) {
-            one.setAttribute('colspan', String(cs - trim));
+        const row = rows[r];
+        for (let i = 0; i < row.cells.length; i++) {
+          const cell = row.cells[i];
+          if (seenCell.has(cell)) continue;
+          seenCell.add(cell);
+          const meta = cellMeta.get(cell);
+          if (!meta) continue;
+          const cs = cell.colSpan || 1;
+          const { startCol } = meta;
+          const endCol = startCol + cs - 1;
+          if (startCol >= newColCount) {
+            toRemove.push(cell);
+          } else if (endCol >= newColCount) {
+            const newCs = newColCount - startCol;
+            if (newCs < 1) toRemove.push(cell);
+            else toUpdate.push({ cell, newCs });
           }
         }
+      }
+
+      for (const cell of toRemove) cell.remove();
+      for (const { cell, newCs } of toUpdate) {
+        if (!cell.parentNode) continue;
+        if (newCs === 1) cell.removeAttribute('colspan');
+        else cell.setAttribute('colspan', String(newCs));
       }
     }
 
