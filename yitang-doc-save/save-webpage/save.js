@@ -132,8 +132,8 @@ function extractBlockContent() {
     }
 
     const fw = cs.fontWeight;
-    if (fw === '700' || fw === 'bold') {
-      styles.push('font-weight: 700');
+    if (fw !== '400' && fw !== 'normal') {
+      styles.push(`font-weight: ${fw}`);
     }
 
     const fs = parseInt(cs.fontSize);
@@ -147,6 +147,51 @@ function extractBlockContent() {
     }
 
     return styles.length ? styles.join('; ') : '';
+  }
+
+  /** 块级元素的排版样式（居中/右对齐等多来自 div/p；span 上不写 text-align） */
+  function getBlockTypographyStyles(el) {
+    const cs = getComputedStyle(el);
+    const styles = [];
+
+    const ta = cs.textAlign;
+    if (ta && ta !== 'start' && ta !== 'left') {
+      styles.push(`text-align: ${ta}`);
+    }
+
+    const va = cs.verticalAlign;
+    if ((va === 'top' || va === 'baseline') && (el.closest && (el.closest('td') || el.closest('th')))) {
+      styles.push(`vertical-align: ${va}`);
+    }
+
+    const fw = cs.fontWeight;
+    if (fw !== '400' && fw !== 'normal') {
+      styles.push(`font-weight: ${fw}`);
+    }
+
+    const fs = parseInt(cs.fontSize, 10);
+    if (fs && fs !== 16 && fs !== 15) {
+      styles.push(`font-size: ${fs}px`);
+    }
+
+    const color = cs.color;
+    if (color && color !== 'rgb(51, 51, 51)' && color !== 'rgb(0, 0, 0)' && color !== 'rgba(0, 0, 0, 0)') {
+      styles.push(`color: ${color}`);
+    }
+
+    const bg = cs.backgroundColor;
+    if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && bg !== 'rgb(255, 255, 255)') {
+      styles.push(`background-color: ${bg}`);
+    }
+
+    return styles.length ? styles.join('; ') : '';
+  }
+
+  function mergeSpanAndBlockTypography(el) {
+    const a = getRenderedStyles(el);
+    const b = getBlockTypographyStyles(el);
+    if (a && b) return `${a}; ${b}`;
+    return a || b;
   }
 
   function getCellComputedStyles(el) {
@@ -224,10 +269,9 @@ function extractBlockContent() {
       if (tag === 'table') {
         let childrenHTML = '';
         for (const child of el.childNodes) {
-          if (child.nodeType === 1 && child.tagName.toLowerCase() === 'colgroup') continue;
           childrenHTML += buildTableHTML(child);
         }
-        return `<table style="width: 100%; border-collapse: collapse; table-layout: fixed;">${childrenHTML}</table>`;
+        return `<table style="width: 100%; border-collapse: collapse;">${childrenHTML}</table>`;
       }
 
       if (['thead', 'tbody', 'tfoot', 'tr'].includes(tag)) {
@@ -385,7 +429,26 @@ function extractBlockContent() {
         const styleAttr = el.getAttribute('style');
         if (span) attrs += ` span="${span}"`;
         if (width) attrs += ` width="${width}"`;
-        if (styleAttr) attrs += ` style="${styleAttr}"`;
+
+        const computedPieces = [];
+        try {
+          const cs = getComputedStyle(el);
+          const w = cs.width;
+          if (w && w !== 'auto' && w !== '0px') computedPieces.push(`width: ${w}`);
+          const minW = cs.minWidth;
+          if (minW && minW !== 'auto' && minW !== '0px') computedPieces.push(`min-width: ${minW}`);
+          const maxW = cs.maxWidth;
+          if (maxW && maxW !== 'none' && maxW !== 'auto' && maxW !== '0px') {
+            computedPieces.push(`max-width: ${maxW}`);
+          }
+        } catch (e) {}
+
+        const styleParts = [];
+        if (styleAttr) styleParts.push(styleAttr.replace(/;\s*$/, '').trim());
+        if (computedPieces.length) styleParts.push(computedPieces.join('; '));
+        const merged = styleParts.filter(Boolean).join('; ');
+        if (merged) attrs += ` style="${merged}"`;
+
         return `<col${attrs}>`;
       }
 
@@ -561,6 +624,28 @@ function extractBlockContent() {
 
     if (tag === 'br') return '<br>';
 
+    if (/^h[1-6]$/.test(tag)) {
+      const style = mergeSpanAndBlockTypography(el);
+      const inCell = !!(el.closest && (el.closest('td') || el.closest('th')));
+      if (inCell) {
+        if (style) return `<div style="${style}">${childrenHTML}</div>`;
+        return childrenHTML;
+      }
+      if (style) return `<${tag} style="${style}">${childrenHTML}</${tag}>`;
+      return `<${tag}>${childrenHTML}</${tag}>`;
+    }
+
+    if (tag === 'p' || tag === 'div') {
+      const style = mergeSpanAndBlockTypography(el);
+      const inCell = !!(el.closest && (el.closest('td') || el.closest('th')));
+      if (inCell) {
+        if (style) return `<div style="${style}">${childrenHTML}</div>`;
+        return childrenHTML;
+      }
+      if (style) return `<${tag} style="${style}">${childrenHTML}</${tag}>`;
+      return childrenHTML;
+    }
+
     if (tag === 'span') {
       const style = getRenderedStyles(el);
       if (style) return `<span style="${style}">${childrenHTML}</span>`;
@@ -577,7 +662,11 @@ function extractBlockContent() {
 
     if (tag === 'ul') return `<ul>${childrenHTML}</ul>`;
     if (tag === 'ol') return `<ol>${childrenHTML}</ol>`;
-    if (tag === 'li') return `<li>${childrenHTML}</li>`;
+    if (tag === 'li') {
+      const style = mergeSpanAndBlockTypography(el);
+      if (style) return `<li style="${style}">${childrenHTML}</li>`;
+      return `<li>${childrenHTML}</li>`;
+    }
 
     return childrenHTML;
   }
@@ -892,7 +981,7 @@ function buildCleanHTML(blocks, imgMap, docTitle) {
     code { font-family: "Fira Code", Consolas, monospace; }
     blockquote { border-left: 4px solid #ddd; margin: 1em 0; padding: 0.5em 1em; color: #555; background: #fafafa; border-radius: 0 4px 4px 0; }
     table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-    td, th { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+    td, th { border: 1px solid #ddd; padding: 8px 12px; }
     th { background: #f5f5f5; font-weight: 600; }
     ul, ol { margin: 0.5em 0; padding-left: 2em; }
     li { margin: 0.3em 0; }
@@ -1024,9 +1113,8 @@ function escapeAttr(text) {
     code { font-family: "Fira Code", Consolas, monospace; }
     blockquote { border-left: 4px solid #ddd; margin: 1em 0; padding: 0.5em 1em; color: #555; background: #fafafa; border-radius: 0 4px 4px 0; }
     .table-wrapper { overflow-x: auto; margin: 1em 0; }
-    .table-wrapper table { table-layout: fixed; }
     table { border-collapse: collapse; width: 100%; }
-    td, th { border: 1px solid #ddd; padding: 8px 12px; text-align: left; word-wrap: break-word; overflow-wrap: anywhere; }
+    td, th { border: 1px solid #ddd; padding: 8px 12px; word-wrap: break-word; overflow-wrap: anywhere; }
     th { background: #f5f5f5; font-weight: 600; }
     td img, th img { max-width: 100%; height: auto; vertical-align: top; }
     #main-content .table-wrapper td .yitang-td-img-row,
