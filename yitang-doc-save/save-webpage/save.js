@@ -325,7 +325,144 @@ function extractBlockContent() {
             }
           }
 
-          let inOl = false, inUl = false;
+          /** 源码 docx 列表块通常已自带 Word 式序号或项目符号，勿再包裹 ol/ul/li（会与浏览器列表符号重复）。
+           * 去掉：(1) 仅序号 + <br> + 正文 的假换行；(2) 相邻 div/p 分段中首段仅为序号时的多余换行（含外层单 div 包裹）。 */
+          function mergeTdNativeListMarkers(html, kind /* 'ordered' | 'unordered' */) {
+            function stripPlain(s) {
+              return (s || '')
+                .replace(/<[^>]+>/g, '')
+                .replace(/[\u200b\u00a0\u3000\u200c\u200d]/g, '')
+                .replace(/\s+/g, '')
+                .trim();
+            }
+
+            function isMarkerPlain(plainCompact) {
+              if (kind === 'ordered') {
+                return /^[（(]?\d{1,4}[)）.．、]?$/.test(plainCompact);
+              }
+              return plainCompact.length === 1 && /^[•●·‧▪\-\*\u2022]$/.test(plainCompact);
+            }
+
+            function mergeLeadingBrSplits(s) {
+              let h = s.trim();
+              for (let guard = 0; guard < 12; guard++) {
+                const m = /^([\s\S]*?)<br\s*\/?(?:\s*)>([\s\S]+)$/i.exec(h);
+                if (!m) break;
+                const head = m[1];
+                const tail = m[2].trim();
+                if (!tail) break;
+                if (!isMarkerPlain(stripPlain(head))) break;
+                h = `${head.trim()} ${tail}`;
+              }
+              return h;
+            }
+
+            /** 仅以「开头的」两个 sibling 分段为对象；首段去掉标签后为短序号，避免误伤正文对照表 */
+            function mergeSiblingBlockPairAtStart(h) {
+              const maxMarkerShell = 120;
+              let s = h.trim();
+
+              function tryOnce(t) {
+                let m =
+                  /^(\s*)<div(\s[^>]*)>([\s\S]*?)<\/div>\s*<div(\s[^>]*)>([\s\S]*?)<\/div>([\s\S]*)$/i.exec(
+                    t
+                  );
+                if (
+                  m &&
+                  m[3].trim().length <= maxMarkerShell &&
+                  isMarkerPlain(stripPlain(m[3]))
+                ) {
+                  return `${m[1]}<div${m[2]}>${m[3].trim()} ${m[5].trim()}</div>${m[6] || ''}`;
+                }
+                m =
+                  /^(\s*)<div(\s[^>]*)>([\s\S]*?)<\/div>\s*<p(\s[^>]*)>([\s\S]*?)<\/p>([\s\S]*)$/i.exec(
+                    t
+                  );
+                if (
+                  m &&
+                  m[3].trim().length <= maxMarkerShell &&
+                  isMarkerPlain(stripPlain(m[3]))
+                ) {
+                  return `${m[1]}<div${m[2]}>${m[3].trim()} ${m[5].trim()}</div>${m[6] || ''}`;
+                }
+                m =
+                  /^(\s*)<p(\s[^>]*)>([\s\S]*?)<\/p>\s*<div(\s[^>]*)>([\s\S]*?)<\/div>([\s\S]*)$/i.exec(
+                    t
+                  );
+                if (
+                  m &&
+                  m[3].trim().length <= maxMarkerShell &&
+                  isMarkerPlain(stripPlain(m[3]))
+                ) {
+                  return `${m[1]}<p${m[2]}>${m[3].trim()} ${m[5].trim()}</p>${m[6] || ''}`;
+                }
+                m =
+                  /^(\s*)<p(\s[^>]*)>([\s\S]*?)<\/p>\s*<p(\s[^>]*)>([\s\S]*?)<\/p>([\s\S]*)$/i.exec(
+                    t
+                  );
+                if (
+                  m &&
+                  m[3].trim().length <= maxMarkerShell &&
+                  isMarkerPlain(stripPlain(m[3]))
+                ) {
+                  return `${m[1]}<p${m[2]}>${m[3].trim()} ${m[5].trim()}</p>${m[6] || ''}`;
+                }
+                return t;
+              }
+
+              for (let round = 0; round < 10; round++) {
+                const next = tryOnce(s);
+                if (next === s) break;
+                s = next;
+              }
+              return s;
+            }
+
+            /** 若整段 html 仅为一个 div 外壳，返回其 innerHTML，否则 null（避免误把外壳当列表首块） */
+            function peelOuterDivOnce(html) {
+              const h = (html || '').trim();
+              const mOpen = h.match(/^<div([^>]*)>/i);
+              if (!mOpen) return null;
+              const openLen = mOpen[0].length;
+              let depth = 1;
+              let i = openLen;
+              while (i < h.length && depth > 0) {
+                const sub = h.slice(i);
+                const m = sub.match(/<\/?div\b[^>]*>/i);
+                if (!m) return null;
+                const tag = m[0];
+                const at = m.index;
+                const closeAbs = i + at;
+                if (/^<\/div/i.test(tag)) {
+                  depth--;
+                  if (depth === 0) {
+                    const inner = h.slice(openLen, closeAbs);
+                    const rest = h.slice(closeAbs + tag.length).trim();
+                    if (rest) return null;
+                    return { attrs: mOpen[1] || '', inner: inner.trim() };
+                  }
+                } else {
+                  depth++;
+                }
+                i = closeAbs + tag.length;
+              }
+              return null;
+            }
+
+            /** 自内向外：先剥壳递归，再在「无整段外壳」的片段上合并 sibling pair */
+            function stripOuterDivAndMerge(s) {
+              const peeled = peelOuterDivOnce(s);
+              if (!peeled) return mergeSiblingBlockPairAtStart(s);
+              const innerDone = stripOuterDivAndMerge(peeled.inner);
+              return `<div${peeled.attrs}>${innerDone}</div>`;
+            }
+
+            let out = mergeLeadingBrSplits(html || '');
+            out = stripOuterDivAndMerge(out);
+            out = mergeLeadingBrSplits(out);
+            return out;
+          }
+
           /** 同一单元格内待输出的图片序列；与源站「一行多图」一致 */
           const imgAccum = [];
           /** 处于横向 docx-grid 内时，单张图也包进 yitang-td-img-row，避免与 column 组合时断行 */
@@ -342,11 +479,6 @@ function extractBlockContent() {
             }
             imgAccum.length = 0;
             gridHorizontalActive = false;
-          }
-
-          function flushLists() {
-            if (inOl) { childrenHTML += '</ol>'; inOl = false; }
-            if (inUl) { childrenHTML += '</ul>'; inUl = false; }
           }
 
           function gridBlockIsHorizontal(el) {
@@ -368,32 +500,33 @@ function extractBlockContent() {
             if (cls.includes('docx-ordered-block')) {
               gridHorizontalActive = false;
               flushImgAccum();
-              if (inUl) { childrenHTML += '</ul>'; inUl = false; }
-              if (!inOl) { childrenHTML += '<ol>'; inOl = true; }
-              childrenHTML += '<li>' + cleanHTML(block) + '</li>';
+              const inner = mergeTdNativeListMarkers(cleanHTML(block), 'ordered');
+              if (inner.trim()) {
+                if (childrenHTML) childrenHTML += '<br>';
+                childrenHTML += inner;
+              }
               markSkipNested(i);
             } else if (cls.includes('docx-bulleted-block') || cls.includes('docx-unordered-block')) {
               gridHorizontalActive = false;
               flushImgAccum();
-              if (inOl) { childrenHTML += '</ol>'; inOl = false; }
-              if (!inUl) { childrenHTML += '<ul>'; inUl = true; }
-              childrenHTML += '<li>' + cleanHTML(block) + '</li>';
+              const inner = mergeTdNativeListMarkers(cleanHTML(block), 'unordered');
+              if (inner.trim()) {
+                if (childrenHTML) childrenHTML += '<br>';
+                childrenHTML += inner;
+              }
               markSkipNested(i);
             } else if (cls.includes('docx-grid-block')) {
               flushImgAccum();
-              flushLists();
               gridHorizontalActive = gridBlockIsHorizontal(block);
             } else if (cls.includes('docx-grid_column-block')) {
               // 占位结构，不 flush 图片以便横栅格内多图连续收集
             } else if (cls.includes('docx-image-block')) {
-              flushLists();
               const img = block.querySelector('img');
               if (img) imgAccum.push(cleanHTML(img));
               markSkipNested(i);
             } else {
               gridHorizontalActive = false;
               flushImgAccum();
-              flushLists();
               const html = cleanHTML(block);
               if (html.trim()) {
                 if (childrenHTML) childrenHTML += '<br>';
@@ -404,7 +537,6 @@ function extractBlockContent() {
           }
 
           flushImgAccum();
-          flushLists();
         } else {
           for (const child of el.childNodes) {
             childrenHTML += cleanHTML(child);
@@ -832,7 +964,6 @@ async function scrollAndExtract(page) {
 
   const allBlocks = new Map();
   let step = 0;
-  const totalSteps = Math.ceil(totalHeight / stepSize);
 
   for (let scrollY = 0; scrollY < totalHeight; scrollY += stepSize) {
     await page.evaluate(y => window.scrollTo(0, y), scrollY);
@@ -840,10 +971,23 @@ async function scrollAndExtract(page) {
 
     const blocks = await page.evaluate(extractBlockContent);
 
-    for (const block of blocks) {
-      if (!allBlocks.has(block.itemId)) {
-        allBlocks.set(block.itemId, block);
+    let cutAt = blocks.length;
+    for (let i = 0; i < blocks.length; i++) {
+      if (matchesYitangActivityHeader(blocks[i])) {
+        cutAt = i;
+        break;
       }
+    }
+
+    for (let i = 0; i < cutAt; i++) {
+      const block = blocks[i];
+      if (!allBlocks.has(block.itemId)) allBlocks.set(block.itemId, block);
+    }
+
+    if (cutAt < blocks.length) {
+      const pct = Math.min(100, Math.round((scrollY / totalHeight) * 100));
+      console.log(`  ℹ 检测到文末「一堂活动信息」起始块，停止继续向下滚动（约 ${pct}%）`);
+      break;
     }
 
     step++;
