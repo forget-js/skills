@@ -1088,7 +1088,7 @@ function escapeAttr(text) {
   const sidebarStyle = `
   <style>
     * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
+    html { scroll-behavior: auto; }
     body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 16px; line-height: 1.8; color: #333; background: #fff; display: flex; }
     #sidebar-toc { position: fixed; left: 0; top: 0; bottom: 0; width: 280px; padding: 20px 0; background: #f8f9fa; border-right: 1px solid #e5e7eb; overflow-y: auto; z-index: 100; }
     #sidebar-toc .toc-title { font-size: 18px; font-weight: 700; padding: 10px 20px 15px; color: #111; border-bottom: 1px solid #e5e7eb; margin-bottom: 8px; }
