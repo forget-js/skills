@@ -824,6 +824,111 @@ function escapeAttr(text) {
     ul, ol { margin: 0.5em 0; padding-left: 2em; }
     li { margin: 0.3em 0; }
     @media (max-width: 900px) { #sidebar-toc { display: none; } #main-content { margin-left: 0; padding: 20px; } }
+    /* 正文内图片点击放大预览（底部工具栏：分页 / 缩放 / 1:1 / 适应，舞台区滚轮滚动） */
+    #main-content img { cursor: zoom-in; }
+    #yitang-img-lightbox {
+      position: fixed;
+      inset: 0;
+      z-index: 10000;
+      display: none;
+      flex-direction: column;
+      box-sizing: border-box;
+      background: rgba(0, 0, 0, 0.88);
+    }
+    #yitang-img-lightbox.is-open { display: flex; }
+    .yitang-lightbox-close {
+      position: fixed;
+      top: 12px;
+      right: 16px;
+      z-index: 10003;
+      width: 44px;
+      height: 44px;
+      padding: 0;
+      border: 0;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      font-size: 26px;
+      line-height: 44px;
+      cursor: pointer;
+    }
+    .yitang-lightbox-close:hover { background: rgba(255, 255, 255, 0.28); }
+    #yitang-lightbox-stage {
+      position: relative;
+      z-index: 1;
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 52px 16px 96px;
+      -webkit-overflow-scrolling: touch;
+    }
+    #yitang-lightbox-inner {
+      flex-shrink: 0;
+      line-height: 0;
+      transform-origin: center center;
+      box-shadow: 0 8px 40px rgba(0, 0, 0, 0.45);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    #yitang-img-lightbox-img {
+      display: block;
+      max-width: none;
+      height: auto;
+      vertical-align: top;
+      cursor: default;
+      user-select: none;
+    }
+    .yitang-lb-toolbar {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10002;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      padding: 8px 14px;
+      max-width: calc(100vw - 32px);
+      border-radius: 999px;
+      background: rgba(36, 36, 38, 0.94);
+      color: #fff;
+      font-size: 13px;
+      line-height: 1.4;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
+      pointer-events: auto;
+    }
+    .yitang-lb-toolbar button {
+      margin: 0;
+      padding: 6px 10px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #fff;
+      font-size: 18px;
+      line-height: 1;
+      cursor: pointer;
+    }
+    .yitang-lb-toolbar button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.12); }
+    .yitang-lb-toolbar button:disabled { opacity: 0.35; cursor: default; }
+    .yitang-lb-toolbar .yitang-lb-counter { min-width: 4.5em; text-align: center; font-variant-numeric: tabular-nums; }
+    .yitang-lb-toolbar .yitang-lb-zoom-pct { min-width: 3.2em; text-align: center; font-variant-numeric: tabular-nums; }
+    .yitang-lb-toolbar .yitang-lb-sep {
+      width: 1px;
+      height: 18px;
+      margin: 0 4px;
+      background: rgba(255, 255, 255, 0.25);
+    }
+    .yitang-lb-toolbar .yitang-lb-label-btn {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      padding: 6px 12px;
+    }
   </style>`;
 
   const scrollScript = [
@@ -847,9 +952,175 @@ function escapeAttr(text) {
     '</script>'
   ].join('\n');
 
+  const imageLightboxFragment = [
+    '<div id="yitang-img-lightbox" role="dialog" aria-modal="true" aria-label="图片预览">',
+    '  <button type="button" class="yitang-lightbox-close" aria-label="关闭">&times;</button>',
+    '  <div id="yitang-lightbox-stage">',
+    '    <div id="yitang-lightbox-inner"><img id="yitang-img-lightbox-img" alt="" draggable="false"></div>',
+    '  </div>',
+    '  <div class="yitang-lb-toolbar" id="yitang-lb-toolbar">',
+    '    <button type="button" class="yitang-lb-prev" aria-label="上一张">&#8249;</button>',
+    '    <span class="yitang-lb-counter" aria-live="polite">0 / 0</span>',
+    '    <button type="button" class="yitang-lb-next" aria-label="下一张">&#8250;</button>',
+    '    <span class="yitang-lb-sep" aria-hidden="true"></span>',
+    '    <button type="button" class="yitang-lb-zoom-out" aria-label="缩小">&#8722;</button>',
+    '    <span class="yitang-lb-zoom-pct">100%</span>',
+    '    <button type="button" class="yitang-lb-zoom-in" aria-label="放大">+</button>',
+    '    <span class="yitang-lb-sep" aria-hidden="true"></span>',
+    '    <button type="button" class="yitang-lb-fit yitang-lb-label-btn" title="适应窗口">适应</button>',
+    '    <button type="button" class="yitang-lb-actual yitang-lb-label-btn" title="实际像素 1:1">1:1</button>',
+    '  </div>',
+    '</div>',
+    '<script>',
+    '(function(){',
+    '  var lb=document.getElementById("yitang-img-lightbox");',
+    '  var stage=document.getElementById("yitang-lightbox-stage");',
+    '  var inner=document.getElementById("yitang-lightbox-inner");',
+    '  var lbi=document.getElementById("yitang-img-lightbox-img");',
+    '  var tb=document.getElementById("yitang-lb-toolbar");',
+    '  var mc=document.getElementById("main-content");',
+    '  if(!lb||!stage||!inner||!lbi||!mc)return;',
+    '  var imgs=[];',
+    '  var idx=0;',
+    '  var scale=1;',
+    '  var rotation=0;',
+    '  var minScale=0.05;',
+    '  var maxScale=12;',
+    '  function $(sel,root){return (root||document).querySelector(sel);}',
+    '  function refreshImgList(){imgs=Array.prototype.slice.call(mc.querySelectorAll("img"));}',
+    '  function fitScale(){',
+    '    var nw=lbi.naturalWidth,nh=lbi.naturalHeight;',
+    '    if(!nw||!nh)return 1;',
+    '    var pad=32;',
+    '    var aw=Math.max(120,stage.clientWidth-pad);',
+    '    var ah=Math.max(120,stage.clientHeight-pad);',
+    '    var s=Math.min(aw/nw,ah/nh);',
+    '    return Math.max(minScale,Math.min(maxScale,s));',
+    '  }',
+    '  function applyView(){',
+    '    var nw=lbi.naturalWidth,nh=lbi.naturalHeight;',
+    '    if(!nw||!nh)return;',
+    '    var w=nw*scale;',
+    '    lbi.style.width=w+"px";',
+    '    lbi.style.height="auto";',
+    '    inner.style.transform="rotate("+rotation+"deg)";',
+    '    var pct=$(".yitang-lb-zoom-pct",lb);',
+    '    if(pct)pct.textContent=Math.round(scale*100)+"%";',
+    '  }',
+    '  function centerScroll(){',
+    '    try{',
+    '      var sl=(stage.scrollWidth-stage.clientWidth)/2;',
+    '      if(sl>0)stage.scrollLeft=sl;',
+    '    }catch(x){}',
+    '  }',
+    '  function runAfterLayout(fn){',
+    '    requestAnimationFrame(function(){requestAnimationFrame(fn);});',
+    '  }',
+    '  function afterImageReady(){',
+    '    applyView();',
+    '    runAfterLayout(function(){',
+    '      applyView();',
+    '      stage.scrollTop=0;',
+    '      centerScroll();',
+    '    });',
+    '  }',
+    '  function setFromIndex(i){',
+    '    refreshImgList();',
+    '    if(!imgs.length)return;',
+    '    idx=Math.max(0,Math.min(i,imgs.length-1));',
+    '    rotation=0;',
+    '    var img=imgs[idx];',
+    '    var src=img.currentSrc||img.src;',
+    '    var alt=img.getAttribute("alt")||"";',
+    '    var readyDone=false;',
+    '    function onReady(){',
+    '      if(readyDone)return;',
+    '      readyDone=true;',
+    '      lbi.onload=null;',
+    '      scale=fitScale();',
+    '      afterImageReady();',
+    '      updateNav();',
+    '    }',
+    '    lbi.onload=function(){onReady();};',
+    '    lbi.onerror=function(){updateNav();};',
+    '    lbi.src=src;',
+    '    lbi.alt=alt;',
+    '    if(lbi.complete&&lbi.naturalWidth)onReady();',
+    '    else updateNav();',
+    '  }',
+    '  function updateNav(){',
+    '    refreshImgList();',
+    '    var c=$(".yitang-lb-counter",lb);',
+    '    var prev=$(".yitang-lb-prev",lb);',
+    '    var next=$(".yitang-lb-next",lb);',
+    '    if(c)c.textContent=(idx+1)+" / "+imgs.length;',
+    '    if(prev)prev.disabled=idx<=0;',
+    '    if(next)next.disabled=idx>=imgs.length-1;',
+    '  }',
+    '  function openFromThumb(thumb){',
+    '    refreshImgList();',
+    '    var i=imgs.indexOf(thumb);',
+    '    if(i<0)return;',
+    '    lb.classList.add("is-open");',
+    '    document.body.style.overflow="hidden";',
+    '    setFromIndex(i);',
+    '  }',
+    '  function closeLb(){',
+    '    lb.classList.remove("is-open");',
+    '    lbi.removeAttribute("src");',
+    '    lbi.onload=null;',
+    '    lbi.onerror=null;',
+    '    document.body.style.overflow="";',
+    '  }',
+    '  mc.addEventListener("click",function(e){',
+    '    var t=e.target;',
+    '    if(t.tagName!=="IMG")return;',
+    '    e.preventDefault();',
+    '    e.stopPropagation();',
+    '    openFromThumb(t);',
+    '  });',
+    '  if(tb){',
+    '    tb.addEventListener("click",function(e){e.stopPropagation();});',
+    '    $(".yitang-lb-prev",lb).addEventListener("click",function(){if(idx>0)setFromIndex(idx-1);});',
+    '    $(".yitang-lb-next",lb).addEventListener("click",function(){if(idx<imgs.length-1)setFromIndex(idx+1);});',
+    '    $(".yitang-lb-zoom-out",lb).addEventListener("click",function(){',
+    '      scale=Math.max(minScale,scale/1.12);applyView();',
+    '    });',
+    '    $(".yitang-lb-zoom-in",lb).addEventListener("click",function(){',
+    '      scale=Math.min(maxScale,scale*1.12);applyView();',
+    '    });',
+    '    $(".yitang-lb-fit",lb).addEventListener("click",function(){rotation=0;scale=fitScale();applyView();runAfterLayout(function(){applyView();centerScroll();});});',
+    '    $(".yitang-lb-actual",lb).addEventListener("click",function(){rotation=0;scale=1;applyView();centerScroll();});',
+    '  }',
+    '  stage.addEventListener("click",function(e){if(e.target===stage)closeLb();});',
+    '  lb.addEventListener("click",function(e){if(e.target===lb)closeLb();});',
+    '  $(".yitang-lightbox-close",lb).addEventListener("click",function(e){e.stopPropagation();closeLb();});',
+    '  document.addEventListener("keydown",function(e){',
+    '    if(!lb.classList.contains("is-open"))return;',
+    '    if(e.key==="Escape"){e.preventDefault();closeLb();return;}',
+    '    if(e.key==="ArrowLeft"&&idx>0){e.preventDefault();setFromIndex(idx-1);}',
+    '    if(e.key==="ArrowRight"&&idx<imgs.length-1){e.preventDefault();setFromIndex(idx+1);}',
+    '  });',
+    '  window.addEventListener("resize",function(){',
+    '    if(!lb.classList.contains("is-open")||!lbi.naturalWidth)return;',
+    '    applyView();',
+    '    centerScroll();',
+    '  });',
+    '  stage.addEventListener("wheel",function(e){',
+    '    if(!lb.classList.contains("is-open"))return;',
+    '    if(e.ctrlKey){',
+    '      e.preventDefault();',
+    '      var z=e.deltaY<0?1.08:1/1.08;',
+    '      scale=Math.max(minScale,Math.min(maxScale,scale*z));applyView();',
+    '    }',
+    '  },{passive:false});',
+    '})();',
+    '</script>'
+  ].join('\n');
+
   html = html.replace(/<style>[\s\S]*?<\/style>/, sidebarStyle);
   html = html.replace('<body>', '<body>\n' + tocHtml + '\n<div id="main-content">' + docTitleBanner);
-  html = html.replace('</body>', '</div>\n' + scrollScript + '\n</body>');
+  html = html.replace('</body>', '</div>\n' + scrollScript + '\n' + imageLightboxFragment + '\n</body>');
 
   // Merge consecutive lists
   html = html.replace(/<\/ol>\n<ol>/g, '');
